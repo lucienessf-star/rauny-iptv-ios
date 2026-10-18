@@ -1,0 +1,76 @@
+name: Gerar IPA do Rauny para AltStore
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+      DART_SUPPRESS_ANALYTICS: 'true'
+      CI: 'true'
+    steps:
+      - name: Obter os arquivos do projeto
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Preparar Flutter oficial
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 3.47.7 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/flutter/bin/flutter" config --no-analytics
+          "$RUNNER_TEMP/flutter/bin/flutter" precache --ios
+
+      - name: Extrair o projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir app
+          unzip -q projeto-ios.zip -d app
+          test -f app/pubspec.yaml
+          test -f app/ios/Runner.xcodeproj/project.pbxproj
+          xcodebuild -version
+
+      - name: Preparar dependências e executar testes
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter test --concurrency=1
+
+      - name: Compilar para iPhone e iPad sem certificado
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign
+          test -f build/ios/iphoneos/Runner.app/Runner
+          lipo -archs build/ios/iphoneos/Runner.app/Runner | grep -q arm64
+
+      - name: Empacotar IPA para assinar pelo AltStore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir Payload
+          cp -R app/build/ios/iphoneos/Runner.app Payload/
+          /usr/bin/zip -r -y -q Rauny-IPTV-iPad-1.5.0.ipa Payload
+          shasum -a 256 Rauny-IPTV-iPad-1.5.0.ipa > SHA256.txt
+
+      - name: Disponibilizar o IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rauny-IPTV-iPad-IPA
+          path: |
+            Rauny-IPTV-iPad-1.5.0.ipa
+            SHA256.txt
+          if-no-files-found: error
+          retention-days: 3

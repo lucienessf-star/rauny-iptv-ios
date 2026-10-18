@@ -1,0 +1,49 @@
+RAUNY IPTV PLAYER 1.5.0 — ATUALIZAÇÃO IPHONE/IPAD
+
+1. Extraia este pacote no PC. Não extraia o arquivo interno projeto-ios.zip.
+2. No seu repositório lucienessf-star/rauny-iptv-ios, abra Code > Add file >
+   Upload files. Envie projeto-ios.zip desta pasta, substituindo o anterior,
+   e clique em Commit changes.
+3. Abra .github/workflows/build-ipad.yml, clique no lápis, substitua TODO o
+   conteúdo pelo texto de build-ipad-COPIAR.txt desta pasta e salve em Commit
+   changes. O arquivo deve continuar se chamando build-ipad.yml.
+4. Abra Actions > Gerar IPA do Rauny para AltStore > Run workflow > Run workflow.
+5. Aguarde ficar verde. Abra Summary e baixe o artefato Rauny-IPTV-iPad-IPA.
+6. Extraia o ZIP baixado. O instalador é Rauny-IPTV-iPad-1.5.0.ipa.
+7. Transfira o IPA ao iPad como antes (iTunes > Compartilhamento de Arquivos >
+   VLC). No AltStore, My Apps > + > escolha o IPA. Use a mesma conta Apple.
+   Instale por cima do Rauny atual; NÃO desinstale nem remova o app antigo.
+
+NOVIDADES
+- Episódios assistidos ficam amarelos e com indicação Assistido.
+- Ao chegar a 90% do episódio ou à conclusão, a marcação fica salva por conta.
+- No menu do episódio, marque/desmarque manualmente. Serve também para os
+  episódios antigos: não é possível recuperar histórico que a versão anterior
+  já apagou. As marcações novas sobrevivem ao encerramento do app.
+- Pular introdução (+60s) é manual, somente em séries. Aparece com os controles
+  no começo da reprodução, por até 10 segundos, e desaparece ao usar ou ao
+  terminar o prazo. Não volta quando tocar na tela. Retomadas a partir de
+  10 segundos do episódio não mostram esse botão. Não pula nada sozinho.
+- Home volta direto ao menu principal e salva o progresso ao sair do player.
+- Novo ícone azul de TV com símbolo de reprodução.
+- Mantidos rotação, áudio, downloads, configurações e próximo episódio.
+
+VALIDAÇÃO
+30 testes Flutter passaram no Windows, incluindo histórico, marcação manual,
+limite de 10 segundos, Home, layouts, rotação, áudio e downloads simulados.
+Análise Dart sem erros ou avisos; há sugestões de estilo no código.
+Arquivos plist, tamanhos dos ícones e integridade do ZIP conferidos.
+O novo IPA ainda precisa ser compilado pelo GitHub e validado no aparelho:
+o Windows não compila o código nativo iOS. O workflow repete os testes antes
+de compilar. Este pacote contém fontes, não um IPA pronto ou assinado.
+Não contém credenciais IPTV, certificados ou dados do seu catálogo.
+O prazo de renovação do AltStore permanece o mesmo.
+
+TESTE NO IPAD
+- Confira login, favoritos, canais ocultos e bloqueados após atualizar.
+- Marque um episódio no menu, saia e volte; confira o amarelo/Assistido.
+- Inicie outro episódio, use +60s e confirme que o botão desaparece.
+- Inicie um episódio desde o começo e espere 10s: toque novamente, o botão
+  não deve voltar. A ausência dos demais controles antes de 10s é normal.
+- Toque Home dentro de uma série: deve voltar diretamente ao menu principal.
+- Confira TV ao vivo, um filme, rotação e avanço automático para o episódio.
