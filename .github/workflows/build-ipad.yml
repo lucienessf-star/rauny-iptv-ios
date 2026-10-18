@@ -62,15 +62,15 @@ jobs:
           set -euo pipefail
           mkdir Payload
           cp -R app/build/ios/iphoneos/Runner.app Payload/
-          /usr/bin/zip -r -y -q Rauny-IPTV-iPad-1.4.7.ipa Payload
-          shasum -a 256 Rauny-IPTV-iPad-1.4.7.ipa > SHA256.txt
+          /usr/bin/zip -r -y -q Rauny-IPTV-iPad-1.5.0.ipa Payload
+          shasum -a 256 Rauny-IPTV-iPad-1.5.0.ipa > SHA256.txt
 
       - name: Disponibilizar o IPA
         uses: actions/upload-artifact@v4
         with:
           name: Rauny-IPTV-iPad-IPA
           path: |
-            Rauny-IPTV-iPad-1.4.7.ipa
+            Rauny-IPTV-iPad-1.5.0.ipa
             SHA256.txt
           if-no-files-found: error
           retention-days: 3
