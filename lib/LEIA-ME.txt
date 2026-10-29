@@ -1,0 +1,80 @@
+Rauny IPTV Player v1.4.2 — TV ao vivo com HLS.js no Chrome
+
+Esta versão deve ser validada no canal que travava. O erro observado no Chrome
+foi de conflito na linha do tempo HLS. A reprodução live web agora usa HLS.js
+1.7.3 com MediaSource, em vez de entregar a playlist ao leitor HLS nativo
+do Chrome. Isso muda o processamento dos trechos; a estabilidade do seu sinal
+ainda precisa ser confirmada.
+
+INSTALAÇÃO MAIS SIMPLES
+1. Pare o aplicativo no terminal do VS Code com Ctrl+C.
+2. Extraia TODO este ZIP em uma pasta separada. Não extraia diretamente em lib.
+3. Abra a pasta extraída e dê dois cliques em INSTALAR.bat.
+   O instalador usa o projeto C:\Users\Rauny\rauny_iptv_player.
+   Ele cria uma pasta backup-antes-hls-DATA-HORA dentro do projeto, copia os
+   arquivos necessários e atualiza as três dependências usadas na integração.
+4. Aguarde a mensagem Instalação concluída. Se houver erro, envie a mensagem.
+5. No terminal do projeto, execute:
+   flutter run -d chrome
+6. Abra o canal. Deve aparecer TV ao vivo • HLS.js conectado.
+   Esse texto confirma a nova versão. Teste o mesmo canal por 15–20 minutos.
+
+IMPORTANTE SOBRE OS ARQUIVOS
+Esta atualização precisa dos três arquivos em lib E do arquivo web/hls.min.js.
+Substituir apenas main.dart não instala a integração.
+A biblioteca é servida pelo próprio app, sem download de CDN durante o uso.
+A licença correspondente está em web/hls-LICENSE.txt (BSD-2-Clause).
+
+INSTALAÇÃO MANUAL / OUTRA PASTA
+Copie lib/main.dart, lib/hls_web.dart e lib/hls_stub.dart para lib do projeto.
+Copie web/hls.min.js e web/hls-LICENSE.txt para web do projeto.
+Na pasta do projeto execute:
+flutter pub add video_player_web:2.4.0 video_player_platform_interface:6.9.0 web:1.1.1
+flutter run -d chrome
+Não substitua o pubspec.yaml inteiro. O pacote mantém as outras dependências.
+
+COMPORTAMENTO
+- HLS.js só é selecionado para TV ao vivo no navegador.
+- Filmes e séries continuam no plugin original, incluindo retomada,
+  progresso e próximo episódio automático. As demais telas foram preservadas.
+- Android/iOS nativos continuam no caminho original do video_player.
+- O monitor espera 20 segundos sem avanço/buffering contínuo. Erros explícitos
+  do player podem acionar recuperação antes desse prazo.
+- Máximo de três reconexões por sessão do canal; Tentar novamente reinicia
+  manualmente o ciclo. Cada nova conexão aguarda dois segundos.
+- HLS.js também realiza retentativas finitas de suas requisições HTTP.
+- Um evento isolado de conclusão não força reconexão de live.
+- Pausa do usuário e tempo em segundo plano não contam como travamento.
+- A TV ao vivo não mostra duração total artificial nem barra de busca.
+- O buffer foi configurado para reprodução convencional, com alvo de três
+  segmentos atrás da borda ao vivo: pode haver mais atraso na transmissão.
+- HLS.js exige permissão CORS do servidor para a playlist e os segmentos.
+  Caso apareça falha HLS de rede, envie a mensagem para diagnóstico.
+
+VALIDAÇÃO REALIZADA
+- Análise Dart: sem problemas apontados.
+- Compilação JavaScript: concluída com o SDK Flutter local.
+- Chrome headless, vídeo público: reprodução por cerca de 8 segundos,
+  MediaSource/blob confirmado, pausa e descarte do controlador aprovados.
+- PlayerPage real com playlist deslizante de teste, gerada a partir de vídeo
+  público: posição avançou 24.996 ms em 25 segundos, mantendo o mesmo
+  controlador e sem exceções JavaScript.
+- Comparação do fonte confirmou preservação das telas, catálogo e rotinas
+  de inicialização VOD, progresso e próximo episódio.
+- Não houve acesso à sua transmissão, nem teste prolongado do seu canal,
+  nem build/teste em iPhone. Os testes públicos não garantem compatibilidade
+  com irregularidades específicas do servidor.
+- Aquele teste padrão widget_test.dart que usa MyApp continua separado desta
+  mudança; ele precisa ser adaptado à classe do seu app antes de flutter test.
+
+PARA VOLTAR À CÓPIA ANTERIOR
+Pare o app. Na pasta backup-antes-hls-DATA-HORA criada pelo instalador, copie
+lib/main.dart e pubspec.yaml de volta aos locais correspondentes no projeto;
+restaure pubspec.lock se existir nesse backup. Execute flutter pub get e
+flutter run -d chrome. Os arquivos HLS adicionais podem permanecer sem uso.
+
+FONTES DA INTEGRAÇÃO
+https://github.com/video-dev/hls.js/releases/tag/v1.7.3
+https://hlsjs.video-dev.org/api-docs/hls.js.hls.attachmedia
+https://github.com/video-dev/hls.js/blob/v1.7.3/docs/API.md
+Vídeo público de teste: https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8

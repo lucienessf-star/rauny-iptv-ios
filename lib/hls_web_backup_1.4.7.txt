@@ -1,0 +1,295 @@
+import 'dart:async';
+import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
+import 'dart:ui_web' as ui_web;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:video_player_platform_interface/video_player_platform_interface.dart';
+import 'package:video_player_web/video_player_web.dart';
+import 'package:web/web.dart' as web;
+
+@JS('Hls')
+extension type _Hls._(JSObject _) implements JSObject {
+  external factory _Hls(JSObject config);
+  external static bool isSupported();
+  external void attachMedia(web.HTMLVideoElement video);
+  external void loadSource(String source);
+  external void on(String event, JSFunction callback);
+  external void stopLoad();
+  external void destroy();
+}
+extension type _HlsError(JSObject _) implements JSObject {
+  external bool get fatal;
+  external String get type;
+  external String get details;
+  external _HlsResponse? get response;
+}
+extension type _HlsResponse(JSObject _) implements JSObject {
+  external int? get code;
+}
+
+void installHlsWeb() {
+  VideoPlayerPlatform.instance = _HlsPlatform();
+}
+
+Future<void>? _scriptFuture;
+Future<void> _ensureHls() {
+  if (globalContext.hasProperty('Hls'.toJS).toDart) return Future.value();
+  return _scriptFuture ??= _loadScript();
+}
+Future<void> _loadScript() async {
+  final script = web.HTMLScriptElement()
+    ..src = Uri.parse(web.document.baseURI).resolve('hls.min.js').toString()
+    ..async = true;
+  final loaded = Completer<void>();
+  final ok = script.onLoad.listen((_) {
+    if (!loaded.isCompleted) loaded.complete();
+  });
+  final failed = script.onError.listen((_) {
+    if (!loaded.isCompleted) loaded.completeError(StateError('HLS_SCRIPT'));
+  });
+  web.document.head!.appendChild(script);
+  try {
+    await loaded.future.timeout(const Duration(seconds: 10));
+    if (!globalContext.hasProperty('Hls'.toJS).toDart) {
+      throw StateError('HLS_SCRIPT');
+    }
+  } catch (_) {
+    script.remove();
+    _scriptFuture = null;
+    rethrow;
+  } finally {
+    await ok.cancel();
+    await failed.cancel();
+  }
+}
+
+// O plugin original continua responsável por filmes e séries.
+class _HlsPlatform extends VideoPlayerPlugin {
+  final Map<int, _LiveVideo> _live = {};
+  int _next = 1000000;
+  @override
+  Future<void> init() async {
+    for (final player in _live.values.toList()) { await player.dispose(); }
+    _live.clear();
+    await super.init();
+  }
+  @override
+  Future<int> createWithOptions(VideoCreationOptions options) async {
+    final source = options.dataSource;
+    if (source.sourceType != DataSourceType.network || source.formatHint != VideoFormat.hls) {
+      return super.createWithOptions(options);
+    }
+    final id = _next++;
+    final player = _LiveVideo(id, source.uri!);
+    _live[id] = player;
+    ui_web.platformViewRegistry.registerViewFactory('rauny-hls-$id', (_) => player.video);
+    unawaited(player.start());
+    return id;
+  }
+  @override
+  Future<void> dispose(int playerId) async {
+    final player = _live.remove(playerId);
+    if (player != null) { await player.dispose(); } else { await super.dispose(playerId); }
+  }
+  @override
+  Stream<VideoEvent> videoEventsFor(int playerId) =>
+      _live[playerId]?.events.stream ?? super.videoEventsFor(playerId);
+  @override
+  Widget buildView(int playerId) => _live.containsKey(playerId)
+      ? HtmlElementView(viewType: 'rauny-hls-$playerId') : super.buildView(playerId);
+  @override
+  Future<void> play(int playerId) async {
+    final p = _live[playerId];
+    if (p == null) { return super.play(playerId); }
+    try { await p.video.play().toDart; }
+    catch (_) { p.fail('AUTOPLAY', 'O navegador bloqueou ou interrompeu o início do vídeo.'); }
+  }
+  @override
+  Future<void> pause(int playerId) async {
+    final p = _live[playerId];
+    if (p == null) { return super.pause(playerId); }
+    p.video.pause();
+  }
+  @override
+  Future<void> setVolume(int playerId, double volume) async {
+    final p = _live[playerId];
+    if (p == null) { return super.setVolume(playerId, volume); }
+    p.video.volume = volume.clamp(0.0, 1.0);
+    p.video.muted = volume == 0;
+  }
+  @override
+  Future<void> setLooping(int playerId, bool looping) async {
+    final p = _live[playerId];
+    if (p == null) { return super.setLooping(playerId, looping); }
+    p.video.loop = looping;
+  }
+  @override
+  Future<void> setPlaybackSpeed(int playerId, double speed) async {
+    final p = _live[playerId];
+    if (p == null) { return super.setPlaybackSpeed(playerId, speed); }
+    p.video.playbackRate = speed;
+  }
+  @override
+  Future<void> seekTo(int playerId, Duration position) async {
+    final p = _live[playerId];
+    if (p == null) { return super.seekTo(playerId, position); }
+    final ranges = p.video.seekable;
+    if (ranges.length == 0) return;
+    final target = (position.inMilliseconds / 1000).clamp(
+      ranges.start(0), ranges.end(ranges.length - 1));
+    p.video.currentTime = target;
+  }
+  @override
+  Future<Duration> getPosition(int playerId) async {
+    final p = _live[playerId];
+    if (p == null) { return super.getPosition(playerId); }
+    p.sendRanges();
+    return Duration(milliseconds: (p.video.currentTime * 1000).round());
+  }
+  @override
+  Future<void> setWebOptions(int playerId, VideoPlayerWebOptions options) async {
+    final p = _live[playerId];
+    if (p == null) { return super.setWebOptions(playerId, options); }
+    p.video.controls = options.controls.enabled;
+  }
+}
+
+class _LiveVideo {
+  _LiveVideo(int id, this.url) : video = web.HTMLVideoElement() {
+    video
+      ..id = 'rauny-hls-$id'
+      ..playsInline = true
+      ..autoplay = false
+      ..controls = false;
+    video.style
+      ..width = '100%'
+      ..height = '100%'
+      ..border = 'none';
+    subscriptions.add(video.onCanPlay.listen((_) {
+      if (!initialized && !disposed) {
+        initialized = true;
+        emit(VideoEvent(eventType: VideoEventType.initialized,
+          // video_player limita a posição à duração. Uma duração zero/negativa
+          // em live congela a posição reportada e pode sinalizar conclusão falsa.
+          // O horizonte abaixo serve apenas ao controlador; a UI live não o exibe.
+          // A janela HLS pode ter duração FINITA, mas cresce durante o canal.
+          // Usá-la aqui congela o limite inicial dentro de video_player.
+          // Esta classe só atende TV ao vivo; o horizonte não é exibido na UI.
+          duration: const Duration(days: 36500),
+          size: Size(video.videoWidth.toDouble(), video.videoHeight.toDouble())));
+      }
+      buffering(false);
+    }));
+    subscriptions.add(video.onPlaying.listen((_) => buffering(false)));
+    subscriptions.add(video.onWaiting.listen((_) => buffering(true)));
+    subscriptions.add(video.onPlay.listen((_) => emit(VideoEvent(
+      eventType: VideoEventType.isPlayingStateUpdate, isPlaying: true))));
+    subscriptions.add(video.onPause.listen((_) => emit(VideoEvent(
+      eventType: VideoEventType.isPlayingStateUpdate, isPlaying: false))));
+    subscriptions.add(video.onEnded.listen((_) => emit(
+      VideoEvent(eventType: VideoEventType.completed))));
+    subscriptions.add(video.onError.listen((_) {
+      final code = video.error?.code;
+      fail('MEDIA_$code', code == 2 ? 'Falha de rede ao ler o vídeo.'
+          : code == 3 ? 'Falha de decodificação do vídeo.'
+          : 'O navegador informou uma falha no vídeo.');
+    }));
+  }
+  final String url;
+  final web.HTMLVideoElement video;
+  final events = StreamController<VideoEvent>();
+  final List<StreamSubscription<web.Event>> subscriptions = [];
+  _Hls? hls;
+  bool disposed = false, initialized = false, failed = false;
+  bool? _buffering;
+  void emit(VideoEvent event) { if (!disposed && !failed) events.add(event); }
+  void buffering(bool value) {
+    if (_buffering == value) return;
+    _buffering = value;
+    emit(VideoEvent(eventType: value ? VideoEventType.bufferingStart : VideoEventType.bufferingEnd));
+  }
+  void fail(String code, String message) {
+    if (disposed || failed) return;
+    failed = true;
+    hls?.stopLoad();
+    video.pause();
+    // Não encaminhar URLs/tokens de eventos HLS para mensagens ou logs.
+    events.addError(PlatformException(code: code, message: message));
+  }
+  Future<void> start() async {
+    try {
+      await _ensureHls();
+      if (disposed) return;
+      if (!_Hls.isSupported()) {
+        if (video.canPlayType('application/vnd.apple.mpegurl').isNotEmpty) {
+          video.src = url;
+          video.load();
+          return;
+        }
+        fail('HLS_UNSUPPORTED', 'Este navegador não oferece suporte ao player HLS.');
+        return;
+      }
+      final instance = _Hls(<String, Object>{
+        'debug': false,
+        'lowLatencyMode': false,
+        'liveSyncDurationCount': 3,
+        'liveMaxLatencyDurationCount': 6,
+        'maxBufferLength': 40,
+        'backBufferLength': 30,
+        'enableWorker': true,
+        'manifestLoadingMaxRetry': 1,
+        'levelLoadingMaxRetry': 1,
+        'fragLoadingMaxRetry': 1,
+      }.jsify() as JSObject);
+      hls = instance;
+      instance.on('hlsError', ((JSString event, _HlsError data) {
+        if (!data.fatal || disposed || failed) return;
+        final network = data.type == 'networkError';
+        // Somente enum interno e número HTTP: nunca URL, token ou corpo da resposta.
+        final rawDetail = data.details;
+        final detail = RegExp(r'^[a-zA-Z]{1,48}$').hasMatch(rawDetail)
+            ? rawDetail : 'erroHLS';
+        final rawCode = data.response?.code;
+        final code = rawCode != null && rawCode >= 0 && rawCode <= 599
+            ? rawCode.toString() : 'indisponível';
+        final explanation = rawCode == 401 || rawCode == 403
+            ? 'O servidor recusou a requisição do player.'
+            : rawCode == 404 || rawCode == 410
+            ? 'O servidor não disponibilizou a lista ou o trecho solicitado.'
+            : rawCode == 429 ? 'O servidor informou excesso de requisições.'
+            : rawCode != null && rawCode >= 500
+            ? 'O servidor informou um erro interno.'
+            : network ? 'Falha ao obter a lista ou um trecho HLS.'
+            : 'Falha no processamento dos trechos HLS.';
+        fail(network ? 'HLS_NETWORK' : 'HLS_MEDIA',
+          'Diagnóstico HLS: $detail; HTTP: $code. $explanation');
+      }).toJS);
+      instance.loadSource(url);
+      instance.attachMedia(video);
+    } catch (_) {
+      fail('HLS_SETUP', 'Não foi possível iniciar o motor HLS. Confira o arquivo web/hls.min.js.');
+    }
+  }
+  void sendRanges() {
+    final ranges = <DurationRange>[];
+    final buffered = video.buffered;
+    for (var i = 0; i < buffered.length; i++) {
+      ranges.add(DurationRange(Duration(milliseconds: (buffered.start(i) * 1000).round()),
+        Duration(milliseconds: (buffered.end(i) * 1000).round())));
+    }
+    emit(VideoEvent(eventType: VideoEventType.bufferingUpdate, buffered: ranges));
+  }
+  Future<void> dispose() async {
+    if (disposed) return;
+    disposed = true;
+    for (final subscription in subscriptions) { await subscription.cancel(); }
+    hls?.destroy();
+    hls = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    video.remove();
+    unawaited(events.close());
+  }
+}

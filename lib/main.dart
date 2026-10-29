@@ -1,0 +1,1891 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'download_button.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
+import 'hls_stub.dart' if (dart.library.js_interop) 'hls_web.dart';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player/video_player.dart';
+
+// Use a mesma imagem do item na grade e nos detalhes.
+String mediaPoster(Map<String, dynamic> item, {bool series = false}) {
+  for (final key in series
+      ? ['cover', 'stream_icon', 'movie_image', 'cover_big']
+      : ['stream_icon', 'movie_image', 'cover', 'cover_big']) {
+    final value = item[key]?.toString().trim() ?? '';
+    final uri = Uri.tryParse(value);
+    if (uri != null && (uri.scheme == 'https' || uri.scheme == 'http') && uri.host.isNotEmpty) return value;
+  }
+  return '';
+}
+
+// Aceita apenas códigos e nomes de classes emitidos pelo módulo Android.
+// Mensagens de rede podem conter URL, usuário e senha e não são copiadas.
+String nativeVideoDiagnostic(Object failure) {
+  if (failure is TimeoutException) return 'Tempo de abertura excedido (25 segundos).';
+  final raw = failure is PlatformException ? failure.message ?? '' : failure.toString();
+  final safe = RegExp(r'ANDROID_MEDIA3 code=[0-9]+; ERROR_CODE_[A-Z0-9_]+(?:; cause=[A-Za-z0-9_$]+|; HTTP=[0-9]{3})*').firstMatch(raw)?.group(0);
+  if (safe != null) return safe;
+  if (failure is MissingPluginException) return 'Módulo de vídeo indisponível.';
+  return 'Falha no módulo de vídeo (${failure.runtimeType}).';
+}
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  installHlsWeb();
+  runApp(const RaunyIptvPlayer());
+}
+
+class RaunyIptvPlayer extends StatelessWidget {
+  const RaunyIptvPlayer({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+    title: 'Rauny IPTV Player', debugShowCheckedModeBanner: false,
+    theme: ThemeData(useMaterial3: true, brightness: Brightness.dark,
+      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3B82F6), brightness: Brightness.dark),
+      scaffoldBackgroundColor: const Color(0xFF080F1D),
+      appBarTheme: const AppBarTheme(backgroundColor: Color(0xFF080F1D),
+        surfaceTintColor: Colors.transparent, elevation: 0),
+      cardTheme: CardThemeData(color: const Color(0xFF16243A),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))),
+      inputDecorationTheme: InputDecorationThemeData(
+        filled: true,
+        fillColor: const Color(0xFF1B2438),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    ),
+    home: const StartupPage(),
+  );
+}
+
+class XtreamApi {
+  final Uri base;
+  final String username, password;
+  XtreamApi(this.base, this.username, this.password);
+  Uri endpoint(String action, [Map<String, String> extra = const {}]) => base.resolve('player_api.php').replace(
+    queryParameters: {'username': username, 'password': password, if (action.isNotEmpty) 'action': action, ...extra});
+  Future<dynamic> get(String action, [Map<String, String> extra = const {}]) async {
+    final response = await http.get(endpoint(action, extra)).timeout(const Duration(seconds: 25));
+    if (response.statusCode != 200) throw Exception('HTTP ${response.statusCode}');
+    return jsonDecode(utf8.decode(response.bodyBytes));
+  }
+  Future<List<Map<String, dynamic>>> list(String action, [Map<String, String> extra = const {}]) async {
+    final data = await get(action, extra);
+    if (data is! List) throw const FormatException('O servidor não retornou uma lista.');
+    return data.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList();
+  }
+  Uri stream(String type, String id, String extension) => base.resolve(
+    '$type/${Uri.encodeComponent(username)}/${Uri.encodeComponent(password)}/${Uri.encodeComponent(id)}.$extension');
+}
+
+// Chrome: armazenamento local opt-in, sem criptografia forte para a senha.
+// Não use "Manter conectado" em computadores compartilhados.
+class SavedLogin {
+  static const key = 'rauny_saved_xtream_login_v07';
+  static Future<void> save(XtreamApi api) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(key, jsonEncode({
+      'server': api.base.toString(), 'username': api.username, 'password': api.password,
+    }));
+  }
+  static Future<void> clear() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(key);
+  }
+  static Future<XtreamApi?> restore() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(key);
+    if (saved == null) return null;
+    try {
+      final data = jsonDecode(saved);
+      if (data is! Map) return null;
+      final root = Uri.tryParse(data['server']?.toString() ?? '');
+      final username = data['username']?.toString() ?? '';
+      final password = data['password']?.toString() ?? '';
+      if (root == null || root.scheme != 'https' || root.host.isEmpty ||
+          root.userInfo.isNotEmpty || root.hasQuery || root.hasFragment ||
+          username.isEmpty || password.isEmpty) return null;
+      return XtreamApi(root, username, password);
+    } catch (_) { return null; }
+  }
+}
+
+Future<void> verifyXtreamLogin(XtreamApi api) async {
+  final auth = await api.get('');
+  if (auth is! Map || auth['user_info'] is! Map ||
+      auth['user_info']['auth'].toString() != '1') {
+    throw const FormatException('Credenciais inválidas ou sessão expirada.');
+  }
+  if (auth['user_info']['status']?.toString().toLowerCase() == 'expired') {
+    throw const FormatException('Assinatura expirada segundo o servidor.');
+  }
+}
+
+class StartupPage extends StatefulWidget {
+  const StartupPage({super.key});
+  @override
+  State<StartupPage> createState() => _StartupPageState();
+}
+class _StartupPageState extends State<StartupPage> {
+  @override
+  void initState() { super.initState(); _start(); }
+  Future<void> _start() async {
+    final api = await SavedLogin.restore();
+    if (api == null) {
+      if (mounted) _replace(const LoginPage());
+      return;
+    }
+    try {
+      await verifyXtreamLogin(api);
+      final visibility = await VisibilityStore.load(api);
+      await visibility.loadParental();
+      if (mounted) _replace(HomePage(api: api, visibility: visibility));
+    } on FormatException catch (e) {
+      await SavedLogin.clear();
+      if (mounted) _replace(LoginPage(initialError: e.message));
+    } catch (_) {
+      // Não apagar credenciais em falhas temporárias de rede/CORS.
+      if (mounted) _replace(const LoginPage(
+        initialError: 'Não foi possível conectar automaticamente. Confira a rede e tente novamente.'));
+    }
+  }
+  void _replace(Widget page) => Navigator.of(context).pushReplacement(
+    MaterialPageRoute(builder: (_) => page));
+  @override
+  Widget build(BuildContext context) => const Scaffold(
+    body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      CircularProgressIndicator(), SizedBox(height: 20),
+      Text('Conectando à sua lista IPTV...'),
+    ])),
+  );
+}
+
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key, this.initialError});
+  final String? initialError;
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+class _LoginPageState extends State<LoginPage> {
+  final form = GlobalKey<FormState>();
+  final server = TextEditingController(), user = TextEditingController(), pass = TextEditingController();
+  bool hidden = true, loading = false, keepConnected = true;
+  @override
+  void initState() { super.initState(); error = widget.initialError; }
+  String? error;
+  @override
+  void dispose() { server.dispose(); user.dispose(); pass.dispose(); super.dispose(); }
+  Future<void> connect() async {
+    if (!form.currentState!.validate()) return;
+    setState(() { loading = true; error = null; });
+    try {
+      final raw = Uri.tryParse(server.text.trim());
+      if (raw == null || raw.scheme != 'https' || raw.host.isEmpty || raw.userInfo.isNotEmpty || raw.hasQuery || raw.hasFragment) {
+        throw const FormatException('Informe uma URL HTTPS válida, sem usuário ou senha na URL.');
+      }
+      final root = Uri.parse(server.text.trim().replaceAll(RegExp(r'/+$'), '') + '/');
+      final api = XtreamApi(root, user.text.trim(), pass.text);
+      await verifyXtreamLogin(api);
+      if (!mounted) return;
+      final visibility = await VisibilityStore.load(api);
+      await visibility.loadParental();
+      if (keepConnected) { await SavedLogin.save(api); }
+      else { await SavedLogin.clear(); }
+      if (!mounted) return;
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => HomePage(api: api, visibility: visibility)));
+    } on FormatException catch (e) {
+      if (mounted) setState(() => error = e.message);
+    } on TimeoutException {
+      if (mounted) setState(() => error = 'Tempo de conexão esgotado.');
+    } catch (_) {
+      if (mounted) setState(() => error = kIsWeb ? 'Falha de conexão. Verifique o servidor, HTTPS e eventuais restrições CORS do Chrome.' : 'Falha de conexão. Verifique o endereço HTTPS do servidor e a conexão do aparelho.');
+    } finally { if (mounted) setState(() => loading = false); }
+  }
+  @override
+  Widget build(BuildContext context) => Scaffold(body: Center(child: SingleChildScrollView(
+    padding: const EdgeInsets.all(24), child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 440),
+    child: Form(key: form, child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const Icon(Icons.live_tv_rounded, size: 68, color: Color(0xFF719BFF)),
+      const SizedBox(height: 20),
+      const Text('Rauny IPTV Player', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8), const Text('Sua TV, filmes e séries em um só lugar'),
+      const SizedBox(height: 32),
+      TextFormField(controller: server, decoration: const InputDecoration(labelText: 'URL HTTPS do servidor', prefixIcon: Icon(Icons.link)),
+        validator: (v) => v == null || v.trim().isEmpty ? 'Informe a URL' : null),
+      const SizedBox(height: 12),
+      TextFormField(controller: user, decoration: const InputDecoration(labelText: 'Usuário', prefixIcon: Icon(Icons.person_outline)),
+        validator: (v) => v == null || v.trim().isEmpty ? 'Informe o usuário' : null),
+      const SizedBox(height: 12),
+      TextFormField(controller: pass, obscureText: hidden,
+        decoration: InputDecoration(labelText: 'Senha', prefixIcon: const Icon(Icons.lock_outline),
+          suffixIcon: IconButton(onPressed: () => setState(() => hidden = !hidden), icon: Icon(hidden ? Icons.visibility_off : Icons.visibility))),
+        validator: (v) => v == null || v.isEmpty ? 'Informe a senha' : null),
+      const SizedBox(height: 8),
+      CheckboxListTile(
+        value: keepConnected,
+        onChanged: loading ? null : (value) => setState(() => keepConnected = value ?? false),
+        title: const Text('Manter conectado'),
+        subtitle: Text(kIsWeb ? 'No Chrome, a senha fica armazenada localmente. Não ative em computadores compartilhados.' : 'Salva os dados de acesso neste aparelho.'),
+        controlAffinity: ListTileControlAffinity.leading,
+        contentPadding: EdgeInsets.zero,
+      ),
+      const SizedBox(height: 8),
+      if (error != null) ...[Text(error!, style: const TextStyle(color: Colors.redAccent), textAlign: TextAlign.center), const SizedBox(height: 12)],
+      SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: loading ? null : connect,
+        icon: loading ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.login),
+        label: Text(loading ? 'Conectando...' : 'Conectar à minha lista'))),
+      const SizedBox(height: 20),
+      const Text('Áudio preferido: Português (Brasil) • Legendas: desligadas',
+        style: TextStyle(fontSize: 12, color: Color(0xFFBBC6DD)), textAlign: TextAlign.center),
+    ]))))));
+}
+
+
+// Progresso local por conta e conteúdo; nunca armazena a URL com credenciais.
+class WatchProgress {
+  static String scope(XtreamApi api) => sha256.convert(utf8.encode('${api.base.origin}${api.base.path}|${api.username}')).toString();
+  static String key(String scope, String type, String id) => 'watch_v11_${scope}_${type}_$id';
+  static Future<Map<String, dynamic>?> get(String scope, String type, String id) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(key(scope, type, id));
+    if (raw == null) return null;
+    try { return Map<String, dynamic>.from(jsonDecode(raw) as Map); } catch (_) { return null; }
+  }
+  static Future<void> save(String scope, String type, String id, String title, String cover, Duration position, Duration duration) async {
+    if (scope.isEmpty || id.isEmpty || type == 'live' || duration.inSeconds <= 0 || position.inSeconds < 5) return;
+    final prefs = await SharedPreferences.getInstance();
+    final k = key(scope, type, id);
+    if (position.inSeconds >= duration.inSeconds - 30) {
+      await prefs.remove(k);
+    } else {
+      await prefs.setString(k, jsonEncode({'type':type,'id':id,'title':title,'cover':cover,
+        'position':position.inSeconds,'duration':duration.inSeconds,'updated':DateTime.now().millisecondsSinceEpoch}));
+    }
+  }
+  static Future<List<Map<String, dynamic>>> list(String scope) async {
+    final prefs = await SharedPreferences.getInstance();
+    final prefix = 'watch_v11_${scope}_';
+    final result = <Map<String, dynamic>>[];
+    for (final k in prefs.getKeys()) {
+      if (!k.startsWith(prefix)) continue;
+      try {
+        final value = jsonDecode(prefs.getString(k) ?? '');
+        if (value is Map) result.add(Map<String, dynamic>.from(value));
+      } catch (_) {}
+    }
+    result.sort((a,b) => ((b['updated'] as num?) ?? 0).compareTo((a['updated'] as num?) ?? 0));
+    return result;
+  }
+}
+String clock(Duration d) {
+  final secs = d.inSeconds < 0 ? 0 : d.inSeconds;
+  final hours = secs ~/ 3600;
+  final minutes = (secs % 3600) ~/ 60;
+  final seconds = secs % 60;
+  return hours > 0 ? '$hours:${minutes.toString().padLeft(2,'0')}:${seconds.toString().padLeft(2,'0')}'
+    : '$minutes:${seconds.toString().padLeft(2,'0')}';
+}
+
+class MediaKind {
+  final String title, categoryAction, itemAction, categoryKey;
+  final IconData icon;
+  const MediaKind(this.title, this.categoryAction, this.itemAction, this.categoryKey, this.icon);
+}
+const kinds = [
+  MediaKind('TV ao vivo', 'get_live_categories', 'get_live_streams', 'category_id', Icons.tv),
+  MediaKind('Filmes', 'get_vod_categories', 'get_vod_streams', 'category_id', Icons.movie),
+  MediaKind('Séries', 'get_series_categories', 'get_series', 'category_id', Icons.video_library),
+];
+
+// Preferências locais por servidor/usuário, sem armazenar senhas.
+class VisibilityStore extends ChangeNotifier {
+  VisibilityStore._(this.scope);
+  final String scope;
+  final Set<String> hiddenCategories = {};
+  final Set<String> hiddenItems = {};
+  final Set<String> favoriteLiveIds = {};
+  final Set<String> favoriteMovieIds = {};
+  final Set<String> favoriteSeriesIds = {};
+  bool isFavoriteMedia(MediaKind kind, Map<String, dynamic> item) {
+    final id = item[kind.title == 'Séries' ? 'series_id' : 'stream_id']?.toString() ?? '';
+    return (kind.title == 'Séries' ? favoriteSeriesIds : favoriteMovieIds).contains(id);
+  }
+  Future<void> toggleFavoriteMedia(MediaKind kind, Map<String, dynamic> item) async {
+    final id = item[kind.title == 'Séries' ? 'series_id' : 'stream_id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    final series = kind.title == 'Séries';
+    final ids = series ? favoriteSeriesIds : favoriteMovieIds;
+    if (!ids.add(id)) ids.remove(id);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('${series ? 'favorite_series' : 'favorite_movies'}_$scope', ids.toList());
+  }
+
+  bool isFavoriteLive(Map<String, dynamic> item) => favoriteLiveIds.contains(item['stream_id']?.toString() ?? '');
+  Future<void> toggleFavoriteLive(Map<String, dynamic> item) async {
+    final id = item['stream_id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    if (!favoriteLiveIds.add(id)) favoriteLiveIds.remove(id);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('favorite_live_$scope', favoriteLiveIds.toList());
+  }
+
+  static Future<VisibilityStore> load(XtreamApi api) async {
+    final scope = '${api.base.origin}${api.base.path}|${api.username}';
+    final store = VisibilityStore._(scope);
+    final prefs = await SharedPreferences.getInstance();
+    store.hiddenCategories.addAll(prefs.getStringList('hidden_categories_$scope') ?? []);
+    store.hiddenItems.addAll(prefs.getStringList('hidden_items_$scope') ?? []);
+    store.favoriteLiveIds.addAll(prefs.getStringList('favorite_live_$scope') ?? []);
+    store.favoriteMovieIds.addAll(prefs.getStringList('favorite_movies_$scope') ?? []);
+    store.favoriteSeriesIds.addAll(prefs.getStringList('favorite_series_$scope') ?? []);
+    return store;
+  }
+
+  final Set<String> lockedCategories = {};
+  final Set<String> lockedItems = {};
+  String? _pinSalt, _pinDigest;
+  bool get hasPin => _pinDigest != null;
+  bool get parentalEnabled => hasPin;
+  int _failedAttempts = 0;
+  DateTime? _cooldownUntil;
+
+  Future<void> loadParental() async {
+    final prefs = await SharedPreferences.getInstance();
+    lockedCategories.addAll(prefs.getStringList('locked_categories_$scope') ?? []);
+    lockedItems.addAll(prefs.getStringList('locked_items_$scope') ?? []);
+    _pinSalt = prefs.getString('parental_salt_$scope');
+    _pinDigest = prefs.getString('parental_hash_$scope');
+    if (_pinSalt == null || _pinDigest == null) { _pinSalt = null; _pinDigest = null; }
+    notifyListeners();
+  }
+  String _hash(String pin, String salt) {
+    List<int> bytes = utf8.encode('$salt:$pin');
+    for (var i = 0; i < 15000; i++) { bytes = sha256.convert(bytes).bytes; }
+    return sha256.convert(bytes).toString();
+  }
+  Future<void> setPin(String pin) async {
+    if (!RegExp(r'^\d{4}(\d{2})?$').hasMatch(pin)) throw const FormatException('Use 4 ou 6 dígitos.');
+    final random = Random.secure();
+    final salt = List.generate(16, (_) => random.nextInt(256)).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    final digest = _hash(pin, salt);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('parental_salt_$scope', salt);
+    await prefs.setString('parental_hash_$scope', digest);
+    _pinSalt = salt; _pinDigest = digest; _failedAttempts = 0; _cooldownUntil = null;
+    notifyListeners();
+  }
+  bool verifyPin(String pin) {
+    if (!hasPin) return false;
+    if (_cooldownUntil != null && DateTime.now().isBefore(_cooldownUntil!)) return false;
+    final valid = _hash(pin, _pinSalt!) == _pinDigest;
+    if (valid) { _failedAttempts = 0; _cooldownUntil = null; }
+    else {
+      _failedAttempts++;
+      if (_failedAttempts >= 5) { _cooldownUntil = DateTime.now().add(const Duration(seconds: 30)); _failedAttempts = 0; }
+    }
+    return valid;
+  }
+  String? get cooldownMessage => _cooldownUntil != null && DateTime.now().isBefore(_cooldownUntil!)
+      ? 'Muitas tentativas. Aguarde 30 segundos e tente novamente.' : null;
+  Future<void> removePin() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('parental_salt_$scope');
+    await prefs.remove('parental_hash_$scope');
+    _pinSalt = null; _pinDigest = null; notifyListeners();
+  }
+  bool categoryLocked(MediaKind kind, String id) => lockedCategories.contains(categoryKey(kind, id));
+  bool itemLocked(MediaKind kind, Map<String, dynamic> item) {
+    final cat = item['category_id']?.toString() ?? '';
+    return lockedItems.contains(itemKey(kind, item)) || (cat.isNotEmpty && categoryLocked(kind, cat));
+  }
+  Future<void> toggleCategoryLock(MediaKind kind, String id) async {
+    final key = categoryKey(kind, id);
+    if (!lockedCategories.add(key)) lockedCategories.remove(key);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('locked_categories_$scope', lockedCategories.toList());
+  }
+  Future<void> toggleItemLock(MediaKind kind, Map<String, dynamic> item) async {
+    final key = itemKey(kind, item);
+    if (!lockedItems.add(key)) lockedItems.remove(key);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('locked_items_$scope', lockedItems.toList());
+  }
+
+  String categoryKey(MediaKind kind, String id) => '${kind.itemAction}:$id';
+  String itemKey(MediaKind kind, Map<String, dynamic> item) {
+    final id = item[kind.title == 'Séries' ? 'series_id' : 'stream_id']?.toString() ?? '';
+    return '${kind.itemAction}:$id';
+  }
+  bool categoryHidden(MediaKind kind, String id) => hiddenCategories.contains(categoryKey(kind, id));
+  bool itemHidden(MediaKind kind, Map<String, dynamic> item) {
+    final id = item[kind.title == 'Séries' ? 'series_id' : 'stream_id']?.toString() ?? '';
+    if (id.isEmpty) return false;
+    final category = item['category_id']?.toString() ?? '';
+    return hiddenItems.contains(itemKey(kind, item)) || (category.isNotEmpty && categoryHidden(kind, category));
+  }
+  Future<void> toggleCategory(MediaKind kind, String id) async {
+    final key = categoryKey(kind, id);
+    if (!hiddenCategories.add(key)) hiddenCategories.remove(key);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('hidden_categories_$scope', hiddenCategories.toList());
+  }
+  Future<void> toggleItem(MediaKind kind, Map<String, dynamic> item) async {
+    final key = itemKey(kind, item);
+    if (!hiddenItems.add(key)) hiddenItems.remove(key);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('hidden_items_$scope', hiddenItems.toList());
+  }
+}
+
+Future<bool> requestParentalPin(BuildContext context, VisibilityStore store, {String title = 'Digite o PIN parental'}) async {
+  if (!store.hasPin) return true;
+  final input = TextEditingController();
+  String? error;
+  final result = await showDialog<bool>(context: context, barrierDismissible: false, builder: (dialogContext) => StatefulBuilder(
+    builder: (context, refresh) => AlertDialog(
+      title: Text(title),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: input, autofocus: true, obscureText: true, keyboardType: TextInputType.number,
+          maxLength: 6, decoration: const InputDecoration(labelText: 'PIN de 4 ou 6 dígitos')),
+        if (error != null) Text(error!, style: const TextStyle(color: Colors.redAccent)),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancelar')),
+        FilledButton(onPressed: () {
+          if (store.verifyPin(input.text)) Navigator.pop(dialogContext, true);
+          else refresh(() => error = store.cooldownMessage ?? 'PIN incorreto.');
+        }, child: const Text('Desbloquear')),
+      ],
+    ),
+  ));
+  input.dispose();
+  return result == true;
+}
+
+class ParentalSettingsPage extends StatefulWidget {
+  final VisibilityStore visibility;
+  const ParentalSettingsPage({super.key, required this.visibility});
+  @override
+  State<ParentalSettingsPage> createState() => _ParentalSettingsPageState();
+}
+class _ParentalSettingsPageState extends State<ParentalSettingsPage> {
+  final pin = TextEditingController(), confirm = TextEditingController();
+  String? message;
+  @override
+  void dispose() { pin.dispose(); confirm.dispose(); super.dispose(); }
+  Future<void> save() async {
+    if (!RegExp(r'^\d{4}(\d{2})?$').hasMatch(pin.text)) { setState(() => message = 'Escolha um PIN com 4 ou 6 dígitos.'); return; }
+    if (pin.text != confirm.text) { setState(() => message = 'Os PINs não coincidem.'); return; }
+    await widget.visibility.setPin(pin.text);
+    pin.clear(); confirm.clear();
+    if (mounted) setState(() => message = 'PIN configurado com sucesso.');
+  }
+  @override
+  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: const Text('Controle parental')),
+    body: ListView(padding: const EdgeInsets.all(20), children: [
+      Text(widget.visibility.hasPin ? 'Proteção por PIN ativada' : 'Crie um PIN para proteger conteúdos e o gerenciamento.',
+        style: const TextStyle(fontSize: 18)),
+      const SizedBox(height: 18),
+      TextField(controller: pin, obscureText: true, maxLength: 6, keyboardType: TextInputType.number,
+        decoration: InputDecoration(labelText: widget.visibility.hasPin ? 'Novo PIN' : 'PIN de 4 ou 6 dígitos')),
+      const SizedBox(height: 8),
+      TextField(controller: confirm, obscureText: true, maxLength: 6, keyboardType: TextInputType.number,
+        decoration: const InputDecoration(labelText: 'Confirmar PIN')),
+      const SizedBox(height: 12),
+      FilledButton(onPressed: save, child: Text(widget.visibility.hasPin ? 'Alterar PIN' : 'Criar PIN')),
+      if (widget.visibility.hasPin) TextButton(onPressed: () async {
+        await widget.visibility.removePin();
+        if (mounted) setState(() => message = 'Proteção por PIN desativada.');
+      }, child: const Text('Desativar PIN')),
+      if (message != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(message!)),
+      const SizedBox(height: 20),
+      const Text('Use o ícone de olho nas listas para ocultar itens ou o cadeado para bloqueá-los. Conteúdos bloqueados permanecem visíveis e exigem PIN para abrir.'),
+      const SizedBox(height: 12),
+      const Text('Atenção: no Chrome, o PIN protege a interface, mas não substitui perfis infantis ou controles do dispositivo. O PIN não é recuperável; mantenha-o em local seguro.',
+        style: TextStyle(color: Color(0xFFBBC6DD))),
+    ]));
+}
+
+class HomePage extends StatelessWidget {
+  final XtreamApi api;
+  final VisibilityStore visibility;
+  const HomePage({super.key, required this.api, required this.visibility});
+
+  Widget _destination(BuildContext context, {required IconData icon, required String title,
+      required String subtitle, required Color color, required VoidCallback onTap}) =>
+    InkWell(onTap: onTap, borderRadius: BorderRadius.circular(20), child: Container(
+      padding: const EdgeInsets.all(18), decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight,
+          colors: [color.withValues(alpha: .24), const Color(0xFF142239)]),
+        border: Border.all(color: color.withValues(alpha: .24))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(
+          color: color.withValues(alpha: .18), borderRadius: BorderRadius.circular(13)),
+          child: Icon(icon, color: color, size: 27)),
+        const Spacer(),
+        Text(title, maxLines: 1, overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 4),
+        Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Color(0xFFB8C6DC), fontSize: 12)),
+        const SizedBox(height: 8),
+        Align(alignment: Alignment.centerRight,
+          child: Icon(Icons.arrow_forward_rounded, color: color, size: 19)),
+      ])));
+
+  Widget _quickLink(BuildContext context, String title, IconData icon, VoidCallback action) =>
+    Padding(padding: const EdgeInsets.only(right: 8), child: ActionChip(
+      avatar: Icon(icon, size: 17, color: const Color(0xFF93C5FD)),
+      label: Text(title), onPressed: action,
+      backgroundColor: const Color(0xFF18263D),
+      side: const BorderSide(color: Color(0xFF293B56)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))));
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerLeft, child: Row(mainAxisSize: MainAxisSize.min, children: [
+      Icon(Icons.play_circle_fill, color: Color(0xFF91AFFF)), SizedBox(width: 10),
+      Text('RAUNY', style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2)),
+      Text(' IPTV', style: TextStyle(fontWeight: FontWeight.w700, color: Color(0xFF60A5FA), letterSpacing: 1)),
+    ])), actions: [
+      IconButton(tooltip: 'Controle parental', icon: const Icon(Icons.shield_outlined), onPressed: () async {
+        if (!await requestParentalPin(context, visibility, title: 'Configurações parentais')) return;
+        if (!context.mounted) return;
+        Navigator.push(context, MaterialPageRoute(builder: (_) => ParentalSettingsPage(visibility: visibility)));
+      }),
+      IconButton(tooltip: 'Sair da conta', icon: const Icon(Icons.logout), onPressed: () async {
+        final shouldLogout = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
+          title: const Text('Sair da conta?'),
+          content: const Text('As credenciais salvas serão apagadas. Seu PIN e suas preferências serão mantidos.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancelar')),
+            FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Sair')),
+          ],
+        ));
+        if (shouldLogout != true || !context.mounted) return;
+        await SavedLogin.clear();
+        if (!context.mounted) return;
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const LoginPage()), (route) => false);
+      }),
+    ]),
+    body: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 1100),
+      child: ListView(padding: const EdgeInsets.all(20), children: [
+        Container(
+          constraints: const BoxConstraints(minHeight: 206),
+          padding: const EdgeInsets.all(24), decoration: BoxDecoration(
+          gradient: const LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight,
+            colors: [Color(0xFF234B99), Color(0xFF162D54), Color(0xFF0C192E)]),
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: const Color(0xFF365D9D))),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Row(children: [Icon(Icons.play_circle_fill_rounded, color: Color(0xFFBFDBFE), size: 25),
+              SizedBox(width: 8), Expanded(child: Text('RAUNY IPTV PLAYER', style: TextStyle(
+                color: Color(0xFFDBEAFE), fontWeight: FontWeight.w800, letterSpacing: 1.3)))]),
+            const SizedBox(height: 24),
+            const Text('Seu entretenimento, do seu jeito.',
+              style: TextStyle(fontSize: 27, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            const Text('Continue seus filmes e séries ou explore o catálogo.',
+              style: TextStyle(color: Color(0xFFD1DDFF))),
+            const SizedBox(height: 16),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              FilledButton.icon(onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => CategoriesPage(api: api, kind: kinds.firstWhere((k) => k.title == 'Filmes'), visibility: visibility))),
+                icon: const Icon(Icons.movie_outlined), label: const Text('Explorar filmes')),
+              OutlinedButton.icon(onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => FavoritesHubPage(api: api, visibility: visibility))),
+                icon: const Icon(Icons.star_border), label: const Text('Favoritos')),
+            ]),
+          ])),
+        const SizedBox(height: 15),
+        SingleChildScrollView(scrollDirection: Axis.horizontal, child: Row(children: [
+          _quickLink(context, 'Início', Icons.home_rounded, () {}),
+          for (final kind in kinds)
+            _quickLink(context, kind.title, kind.icon, () => Navigator.push(context,
+              MaterialPageRoute(builder: (_) => CategoriesPage(api: api, kind: kind, visibility: visibility)))),
+          _quickLink(context, 'Favoritos', Icons.star_rounded, () => Navigator.push(context,
+            MaterialPageRoute(builder: (_) => FavoritesHubPage(api: api, visibility: visibility)))),
+        ])),
+        const SizedBox(height: 24),
+        FutureBuilder<List<Map<String, dynamic>>>(
+          future: WatchProgress.list(WatchProgress.scope(api)),
+          builder: (context, snapshot) {
+            final entries = snapshot.data ?? [];
+            if (entries.isEmpty) return const SizedBox.shrink();
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Continuar assistindo', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              SizedBox(height: 218, child: ListView.separated(scrollDirection: Axis.horizontal,
+                itemCount: entries.length, separatorBuilder: (_, __) => const SizedBox(width: 12),
+                itemBuilder: (context, i) {
+                  final item = entries[i];
+                  final id = item['id']?.toString() ?? '';
+                  final type = item['type']?.toString() ?? 'movie';
+                  final title = item['title']?.toString() ?? 'Sem título';
+                  final cover = item['cover']?.toString() ?? '';
+                  final pos = (item['position'] as num?)?.toInt() ?? 0;
+                  final total = (item['duration'] as num?)?.toInt() ?? 0;
+                  return SizedBox(width: 160, child: InkWell(onTap: () async {
+                    final url = api.stream(type == 'series' ? 'series' : 'movie', id, item['extension']?.toString() ?? 'mp4');
+                    await Navigator.push(context, MaterialPageRoute(builder: (_) => PlayerPage(
+                      title: title, url: url, progressScope: WatchProgress.scope(api), mediaType: type,
+                      mediaId: id, cover: cover, extension: item['extension']?.toString() ?? 'mp4')));
+                    if (context.mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => HomePage(api: api, visibility: visibility)));
+                  }, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Expanded(child: ClipRRect(borderRadius: BorderRadius.circular(12), child: SizedBox(width: 150,
+                      child: cover.startsWith('http') ? Image.network(cover, key: ValueKey(cover), fit: BoxFit.cover,
+                        errorBuilder: (_,__,___) => const Icon(Icons.movie)) : const Icon(Icons.movie)))),
+                    const SizedBox(height: 5),
+                    Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    const SizedBox(height: 5),
+                    LinearProgressIndicator(value: total > 0 ? (pos / total).clamp(0.0,1.0) : 0),
+                    Text('${clock(Duration(seconds: pos))} de ${clock(Duration(seconds: total))}',
+                      style: const TextStyle(fontSize: 11, color: Color(0xFFBBC6DD))),
+                  ])));
+                })),
+              const SizedBox(height: 24),
+            ]);
+          }),
+        const Text('Explore o catálogo', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 14),
+        LayoutBuilder(builder: (context, constraints) {
+          final columns = constraints.maxWidth >= 780 ? 4 : constraints.maxWidth >= 480 ? 2 : 1;
+          return GridView.count(shrinkWrap: true, physics: const NeverScrollableScrollPhysics(),
+            crossAxisCount: columns, mainAxisSpacing: 14, crossAxisSpacing: 14,
+            childAspectRatio: ((constraints.maxWidth - (columns - 1) * 14) / columns) / 220,
+            children: [
+              _destination(context, icon: Icons.star_rounded, title: 'Meus Favoritos',
+                subtitle: 'Seus canais em um só lugar', color: const Color(0xFFFFCA6A),
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FavoritesHubPage(
+                  api: api, visibility: visibility)))),
+              for (final kind in kinds)
+                _destination(context, icon: kind.icon, title: kind.title,
+                  subtitle: kind.title == 'TV ao vivo' ? 'Assista seus canais' :
+                    kind.title == 'Filmes' ? 'Explore os filmes' : 'Explore as séries',
+                  color: kind.title == 'TV ao vivo' ? const Color(0xFF8AB4FF) :
+                    kind.title == 'Filmes' ? const Color(0xFFECA1B9) : const Color(0xFF9EDBC1),
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
+                    CategoriesPage(api: api, kind: kind, visibility: visibility)))),
+            ]);
+        }),
+        const SizedBox(height: 25),
+        const Text('As capas e logotipos são fornecidos pelo seu servidor IPTV.',
+          style: TextStyle(color: Color(0xFF9AA9C4), fontSize: 12)),
+      ]))),
+  );
+}
+
+class CategoriesPage extends StatefulWidget {
+  final XtreamApi api;
+  final MediaKind kind;
+  final VisibilityStore visibility;
+  const CategoriesPage({super.key, required this.api, required this.kind, required this.visibility});
+  @override
+  State<CategoriesPage> createState() => _CategoriesPageState();
+}
+class _CategoriesPageState extends State<CategoriesPage> {
+  bool managing = false;
+  bool managingLocks = false;
+  late Future<List<Map<String, dynamic>>> future;
+  @override
+  void initState() { super.initState(); future = widget.api.list(widget.kind.categoryAction); }
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: Text('${widget.kind.title} • Categorias'), actions: [
+      IconButton(tooltip: managing ? 'Concluir edição' : 'Ocultar ou restaurar categorias',
+        icon: Icon(managing ? Icons.check : Icons.visibility_off_outlined), onPressed: () async {
+          if (!managing && !await requestParentalPin(context, widget.visibility, title: 'Gerenciar categorias ocultas')) return;
+          if (mounted) setState(() { managing = !managing; managingLocks = false; });
+        }),
+      IconButton(tooltip: managingLocks ? 'Concluir bloqueios' : 'Bloquear categorias com PIN',
+        icon: Icon(managingLocks ? Icons.check : Icons.lock_outline),
+        onPressed: () async {
+          if (!widget.visibility.hasPin) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Crie um PIN nas configurações primeiro.'))); return; }
+          if (!managingLocks && !await requestParentalPin(context, widget.visibility)) return;
+          if (mounted) setState(() { managingLocks = !managingLocks; managing = false; });
+        }),
+      IconButton(tooltip: 'Pesquisar em todas as categorias', icon: const Icon(Icons.search),
+        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ItemsPage(
+          api: widget.api, kind: widget.kind, categoryId: '', title: 'Buscar em ${widget.kind.title}', globalSearch: true, visibility: widget.visibility)))),
+    ]),
+    body: Column(children: [
+      if (widget.kind.title == 'TV ao vivo' && !managing && !managingLocks)
+        Padding(padding: const EdgeInsets.fromLTRB(12, 8, 12, 4), child: Card(child: ListTile(
+          leading: const Icon(Icons.star_rounded, color: Color(0xFFFFCE66)),
+          title: const Text('Meus Favoritos'),
+          subtitle: const Text('Canais selecionados de todas as categorias'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ItemsPage(
+            api: widget.api, kind: widget.kind, categoryId: '', title: 'Meus Favoritos',
+            visibility: widget.visibility, favoritesOnly: true)))))),
+      if (widget.kind.title != 'TV ao vivo') Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+        child: SizedBox(width: double.infinity, child: OutlinedButton.icon(
+          icon: const Icon(Icons.search), label: Text('Buscar em todas as ${widget.kind.title.toLowerCase()}'),
+          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ItemsPage(
+            api: widget.api, kind: widget.kind, categoryId: '', title: 'Buscar em ${widget.kind.title}', globalSearch: true, visibility: widget.visibility))),
+        )),
+      ),
+      if (managing || managingLocks) Padding(padding: const EdgeInsets.all(8), child: Text(managingLocks ? 'Toque no cadeado para bloquear ou desbloquear uma categoria.' : 'Toque no olho para ocultar ou restaurar uma categoria.')),
+      Expanded(child: AnimatedBuilder(animation: widget.visibility, builder: (context, _) => FutureBuilder<List<Map<String, dynamic>>>(future: future, builder: (context, snapshot) {
+      if (snapshot.connectionState != ConnectionState.done) return const Center(child: CircularProgressIndicator());
+      if (snapshot.hasError) return const Center(child: Text('Não foi possível carregar as categorias.'));
+      final all = snapshot.data ?? [];
+      final items = (managing || managingLocks) ? all : all.where((c) => !widget.visibility.categoryHidden(widget.kind, c['category_id']?.toString() ?? '')).toList();
+      items.sort((a, b) => (a['category_name']?.toString() ?? '').toLowerCase().compareTo((b['category_name']?.toString() ?? '').toLowerCase()));
+      if (items.isEmpty) return Center(child: Text(managing ? 'Nenhuma categoria encontrada.' : 'Nenhuma categoria visível. Toque no ícone de olho para restaurar.'));
+      return ListView.builder(itemCount: items.length, itemBuilder: (context, i) {
+        final category = items[i];
+        final id = category['category_id']?.toString() ?? '';
+        final hidden = widget.visibility.categoryHidden(widget.kind, id);
+        return Card(margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 3), child: ListTile(leading: Icon(widget.kind.icon, color: const Color(0xFF9DB8FF)), title: Text(category['category_name']?.toString() ?? 'Sem nome',
+            style: TextStyle(color: hidden ? Colors.white54 : null)),
+          trailing: (managing || managingLocks) ? IconButton(
+            tooltip: managingLocks ? 'Alternar bloqueio' : (hidden ? 'Restaurar categoria' : 'Ocultar categoria'),
+            icon: Icon(managingLocks ? (widget.visibility.categoryLocked(widget.kind, id) ? Icons.lock : Icons.lock_open) : (hidden ? Icons.visibility_off : Icons.visibility)),
+            onPressed: id.isEmpty ? null : () => managingLocks ? widget.visibility.toggleCategoryLock(widget.kind, id) : widget.visibility.toggleCategory(widget.kind, id)) : const Icon(Icons.chevron_right),
+          onTap: (managing || managingLocks) ? null : () async {
+            if (widget.visibility.hasPin && widget.visibility.categoryLocked(widget.kind, id) && !await requestParentalPin(context, widget.visibility, title: 'Categoria protegida')) return;
+            if (!context.mounted) return;
+            Navigator.push(context, MaterialPageRoute(
+            builder: (_) => ItemsPage(api: widget.api, kind: widget.kind, visibility: widget.visibility,
+              categoryId: id, title: category['category_name']?.toString() ?? 'Categoria')));
+          }));
+      });
+    }))),
+    ]),
+  );
+}
+
+class ItemsPage extends StatefulWidget {
+  final XtreamApi api;
+  final MediaKind kind;
+  final String categoryId, title;
+  final bool globalSearch;
+  final bool favoritesOnly;
+  final VisibilityStore visibility;
+  const ItemsPage({super.key, required this.api, required this.kind, required this.categoryId, required this.title, required this.visibility, this.globalSearch = false, this.favoritesOnly = false});
+  @override
+  State<ItemsPage> createState() => _ItemsPageState();
+}
+class _ItemsPageState extends State<ItemsPage> {
+  late Future<List<Map<String, dynamic>>> future;
+  String search = '';
+  bool managing = false;
+  bool managingLocks = false;
+  @override
+  void initState() { super.initState(); future = widget.api.list(widget.kind.itemAction, (widget.globalSearch || widget.favoritesOnly) ? const {} : {'category_id': widget.categoryId}); }
+  @override
+  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: Text(widget.title), actions: [
+      IconButton(tooltip: managing ? 'Concluir edição' : 'Ocultar ou restaurar títulos',
+        icon: Icon(managing ? Icons.check : Icons.visibility_off_outlined),
+        onPressed: () async {
+          if (!managing && !await requestParentalPin(context, widget.visibility, title: 'Gerenciar itens ocultos')) return;
+          if (mounted) setState(() { managing = !managing; managingLocks = false; });
+        }),
+      IconButton(tooltip: managingLocks ? 'Concluir bloqueios' : 'Bloquear títulos com PIN',
+        icon: Icon(managingLocks ? Icons.check : Icons.lock_outline), onPressed: () async {
+          if (!widget.visibility.hasPin) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Crie um PIN nas configurações primeiro.'))); return; }
+          if (!managingLocks && !await requestParentalPin(context, widget.visibility)) return;
+          if (mounted) setState(() { managingLocks = !managingLocks; managing = false; });
+        }),
+    ]),
+    body: Column(children: [
+      if (managing || managingLocks) Padding(padding: const EdgeInsets.all(8), child: Text(managingLocks ? 'Toque no cadeado para bloquear ou desbloquear um título.' : 'Toque no olho para ocultar ou restaurar um título.')),
+      Padding(padding: const EdgeInsets.all(12), child: TextField(
+        decoration: InputDecoration(prefixIcon: const Icon(Icons.search), hintText: widget.favoritesOnly ? 'Pesquisar nos meus favoritos' : widget.globalSearch ? 'Buscar título em todas as categorias' : 'Pesquisar nesta categoria'),
+        onChanged: (v) => setState(() => search = v.toLowerCase()))),
+      Expanded(child: AnimatedBuilder(animation: widget.visibility, builder: (context, _) => FutureBuilder<List<Map<String, dynamic>>>(future: future, builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) return const Center(child: CircularProgressIndicator());
+        if (snapshot.hasError) return Center(child: Padding(padding: const EdgeInsets.all(20), child: Text('Não foi possível carregar o catálogo. O servidor pode não permitir consultas globais.\n${snapshot.error}', textAlign: TextAlign.center)));
+        final items = search.trim().isEmpty && widget.globalSearch && !widget.favoritesOnly && !managing && !managingLocks ? <Map<String, dynamic>>[] : (snapshot.data ?? []).where((item) =>
+          (widget.favoritesOnly ? (widget.kind.title == 'TV ao vivo' ? widget.visibility.isFavoriteLive(item) : widget.visibility.isFavoriteMedia(widget.kind, item)) : true) &&
+          ((managing || managingLocks) || !widget.visibility.itemHidden(widget.kind, item)) &&
+          (item['name']?.toString() ?? '').toLowerCase().contains(search.trim())).toList();
+        items.sort((a, b) => (a['name']?.toString() ?? '').toLowerCase().compareTo((b['name']?.toString() ?? '').toLowerCase()));
+        if (items.isEmpty) return Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(widget.favoritesOnly && search.isEmpty ? 'Nenhum favorito aqui. Toque na estrela de um título para adicioná-lo.' : widget.globalSearch && search.isEmpty ? 'Digite um título acima para pesquisar.' : 'Nenhum resultado encontrado.', textAlign: TextAlign.center)));
+        if (widget.kind.title != 'TV ao vivo' && !managing && !managingLocks) {
+          return LayoutBuilder(builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 1100 ? 6 : constraints.maxWidth >= 800 ? 5 :
+              constraints.maxWidth >= 550 ? 4 : constraints.maxWidth >= 340 ? 3 : 2;
+            return GridView.builder(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 20),
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: columns, crossAxisSpacing: 12, mainAxisSpacing: 14,
+                childAspectRatio: .60),
+              itemCount: items.length,
+              itemBuilder: (context, i) {
+                final item = items[i];
+                final name = item['name']?.toString() ?? 'Sem título';
+                final cover = mediaPoster(item, series: widget.kind.title == 'Séries');
+                final hasCover = cover.startsWith('https://') || cover.startsWith('http://');
+                final locked = widget.visibility.hasPin && widget.visibility.itemLocked(widget.kind, item);
+                return InkWell(key: ValueKey('${widget.kind.title}:${item['stream_id'] ?? item['series_id']}'), borderRadius: BorderRadius.circular(14), onTap: () async {
+                  if (locked && !await requestParentalPin(context, widget.visibility, title: 'Conteúdo protegido')) return;
+                  if (!context.mounted) return;
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => MediaDetailsPage(
+                    api: widget.api, kind: widget.kind, item: item, visibility: widget.visibility)));
+                }, child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Expanded(child: ClipRRect(borderRadius: BorderRadius.circular(12), child: Stack(
+                    fit: StackFit.expand, children: [
+                      ColoredBox(color: const Color(0xFF202B42), child: hasCover
+                        ? Image.network(cover, key: ValueKey(cover), fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Icon(widget.kind.icon, size: 48, color: const Color(0xFF7C90B5)))
+                        : Icon(widget.kind.icon, size: 48, color: const Color(0xFF7C90B5))),
+                      Positioned(right: 4, top: 4, child: Material(color: Colors.black54,
+                        borderRadius: BorderRadius.circular(24), child: IconButton(
+                          tooltip: widget.visibility.isFavoriteMedia(widget.kind, item) ? 'Remover dos favoritos' : 'Adicionar aos favoritos',
+                          icon: Icon(widget.visibility.isFavoriteMedia(widget.kind, item) ? Icons.star_rounded : Icons.star_border_rounded,
+                            color: widget.visibility.isFavoriteMedia(widget.kind, item) ? const Color(0xFFFFCE66) : Colors.white),
+                          onPressed: () => widget.visibility.toggleFavoriteMedia(widget.kind, item)))),
+                      if (locked) const Positioned(left: 8, top: 8,
+                        child: Icon(Icons.lock_rounded, color: Colors.white)),
+                    ]))),
+                  const SizedBox(height: 7),
+                  Text(name, maxLines: 2, overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                ]));
+              });
+          });
+        }
+        return ListView.builder(itemCount: items.length, itemBuilder: (context, i) {
+          final item = items[i];
+          final name = item['name']?.toString() ?? 'Sem título';
+          final image = (item['stream_icon'] ?? item['cover'] ?? '').toString();
+          return Card(margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 3), child: ListTile(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+            leading: (image.startsWith('https://') || image.startsWith('http://')) ? Image.network(image, width: 52, height: 52, fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => const Icon(Icons.play_circle_outline)) : const Icon(Icons.play_circle_outline),
+            title: Text(name, style: TextStyle(color: widget.visibility.itemHidden(widget.kind, item) ? Colors.white54 : null)),
+            trailing: (!managing && !managingLocks && widget.kind.title == 'TV ao vivo')
+              ? Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton(
+                    tooltip: widget.visibility.isFavoriteLive(item) ? 'Remover dos favoritos' : 'Adicionar aos favoritos',
+                    icon: Icon(widget.visibility.isFavoriteLive(item) ? Icons.star_rounded : Icons.star_border_rounded,
+                      color: widget.visibility.isFavoriteLive(item) ? const Color(0xFFFFCE66) : null),
+                    onPressed: () => widget.visibility.toggleFavoriteLive(item)),
+                  Icon(widget.visibility.hasPin && widget.visibility.itemLocked(widget.kind, item) ? Icons.lock_outline : Icons.chevron_right),
+                ])
+              : (managing || managingLocks) ? IconButton(
+              tooltip: widget.visibility.hiddenItems.contains(widget.visibility.itemKey(widget.kind, item)) ? 'Restaurar título' : 'Ocultar título',
+              icon: Icon(managingLocks ? (widget.visibility.lockedItems.contains(widget.visibility.itemKey(widget.kind, item)) ? Icons.lock : Icons.lock_open) : (widget.visibility.hiddenItems.contains(widget.visibility.itemKey(widget.kind, item)) ? Icons.visibility_off : Icons.visibility)),
+              onPressed: () => managingLocks ? widget.visibility.toggleItemLock(widget.kind, item) : widget.visibility.toggleItem(widget.kind, item)) : Icon(widget.visibility.hasPin && widget.visibility.itemLocked(widget.kind, item) ? Icons.lock_outline : Icons.chevron_right),
+            onTap: (managing || managingLocks) ? null : () async {
+              if (widget.visibility.hasPin && widget.visibility.itemLocked(widget.kind, item) && !await requestParentalPin(context, widget.visibility, title: 'Conteúdo protegido')) return;
+              if (!context.mounted) return;
+              if (widget.kind.title == 'Séries') {
+                Navigator.push(context, MaterialPageRoute(builder: (_) => SeriesPage(api: widget.api,
+                  seriesId: item['series_id']?.toString() ?? '', title: name)));
+              } else {
+                final id = item['stream_id']?.toString();
+                if (id == null) return;
+                final live = widget.kind.title == 'TV ao vivo';
+                final extension = live ? 'm3u8' : (item['container_extension']?.toString() ?? 'mp4');
+                final url = widget.api.stream(live ? 'live' : 'movie', id, extension);
+                Navigator.push(context, MaterialPageRoute(builder: (_) => PlayerPage(title: name, url: url, progressScope: live ? '' : WatchProgress.scope(widget.api), mediaType: live ? 'live' : 'movie', mediaId: id, cover: (item['stream_icon'] ?? item['cover'] ?? '').toString(), extension: extension)));
+              }
+            },
+          ));
+        });
+      }))),
+    ]),
+  );
+}
+
+
+class FavoritesHubPage extends StatelessWidget {
+  final XtreamApi api;
+  final VisibilityStore visibility;
+  const FavoritesHubPage({super.key, required this.api, required this.visibility});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Meus Favoritos')),
+    body: AnimatedBuilder(animation: visibility, builder: (context, _) => ListView(children: [
+      for (final kind in kinds) Card(child: ListTile(
+        leading: Icon(kind.title == 'TV ao vivo' ? Icons.star_rounded : kind.icon, color: const Color(0xFFFFCE66)),
+        title: Text(kind.title == 'TV ao vivo' ? 'Canais favoritos' : kind.title == 'Filmes' ? 'Filmes favoritos' : 'Séries favoritas'),
+        subtitle: Text('${kind.title == 'TV ao vivo' ? visibility.favoriteLiveIds.length : kind.title == 'Filmes' ? visibility.favoriteMovieIds.length : visibility.favoriteSeriesIds.length} salvos'),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ItemsPage(
+          api: api, kind: kind, categoryId: '', title: '${kind.title} • Favoritos',
+          visibility: visibility, favoritesOnly: true))),
+      )),
+    ])),
+  );
+}
+
+class MediaDetailsPage extends StatefulWidget {
+  final XtreamApi api;
+  final MediaKind kind;
+  final Map<String, dynamic> item;
+  final VisibilityStore visibility;
+  const MediaDetailsPage({super.key, required this.api, required this.kind,
+    required this.item, required this.visibility});
+  @override
+  State<MediaDetailsPage> createState() => _MediaDetailsPageState();
+}
+class _MediaDetailsPageState extends State<MediaDetailsPage> {
+  late final Future<dynamic> details;
+  bool get series => widget.kind.title == 'Séries';
+  @override
+  void initState() {
+    super.initState();
+    final id = widget.item[series ? 'series_id' : 'stream_id']?.toString() ?? '';
+    details = widget.api.get(series ? 'get_series_info' : 'get_vod_info',
+      {series ? 'series_id' : 'vod_id': id}).catchError((_) => <String, dynamic>{});
+  }
+  String field(Map<String, dynamic> data, List<String> keys) {
+    for (final key in keys) {
+      final value = data[key]?.toString().trim() ?? '';
+      if (value.isNotEmpty && value != 'null') return value;
+    }
+    return '';
+  }
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: Text(widget.item['name']?.toString() ?? 'Detalhes')),
+    body: FutureBuilder<dynamic>(future: details, builder: (context, snapshot) {
+      final data = snapshot.data is Map ? Map<String, dynamic>.from(snapshot.data as Map) : <String, dynamic>{};
+      final info = data['info'] is Map ? Map<String, dynamic>.from(data['info'] as Map) : data;
+      final name = widget.item['name']?.toString() ?? 'Sem título';
+      final itemPoster = mediaPoster(widget.item, series: series);
+      final cover = itemPoster.isNotEmpty ? itemPoster : mediaPoster(info, series: series);
+      final synopsis = field(info, ['plot', 'description', 'storyline']);
+      final year = field(info, ['releasedate', 'releaseDate', 'year']);
+      final duration = field(info, ['duration', 'episode_run_time']).isNotEmpty ? field(info, ['duration', 'episode_run_time']) : field(widget.item, ['duration']);
+      final rating = field(info, ['rating', 'rating_5based']);
+      return ListView(padding: const EdgeInsets.all(20), children: [
+        Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 240),
+          child: AspectRatio(aspectRatio: 2 / 3, child: ClipRRect(
+            borderRadius: BorderRadius.circular(16), child: cover.startsWith('http')
+              ? Image.network(cover, key: ValueKey(cover), fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.movie, size: 72))
+              : const ColoredBox(color: Color(0xFF202B42), child: Icon(Icons.movie, size: 72)))))),
+        const SizedBox(height: 20),
+        Text(name, textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall),
+        const SizedBox(height: 8),
+        Text([year, duration, if (rating.isNotEmpty) 'Nota $rating'].where((v) => v.isNotEmpty).join('  •  '),
+          textAlign: TextAlign.center),
+        const SizedBox(height: 16),
+        FilledButton.icon(icon: const Icon(Icons.play_arrow), label: Text(series ? 'Ver episódios' : 'Assistir'),
+          onPressed: () {
+            if (series) {
+              Navigator.push(context, MaterialPageRoute(builder: (_) => SeriesPage(api: widget.api,
+                seriesId: widget.item['series_id']?.toString() ?? '', title: name)));
+            } else {
+              final id = widget.item['stream_id']?.toString();
+              if (id == null || id.isEmpty) return;
+              final ext = widget.item['container_extension']?.toString() ?? 'mp4';
+              Navigator.push(context, MaterialPageRoute(builder: (_) => PlayerPage(
+                title: name, url: widget.api.stream('movie', id, ext), progressScope: WatchProgress.scope(widget.api), mediaType: 'movie', mediaId: id, cover: cover, extension: ext)));
+            }
+          }),
+        const SizedBox(height: 8),
+        AnimatedBuilder(animation: widget.visibility, builder: (context, _) => OutlinedButton.icon(
+          icon: Icon(widget.visibility.isFavoriteMedia(widget.kind, widget.item) ? Icons.star : Icons.star_border),
+          label: Text(widget.visibility.isFavoriteMedia(widget.kind, widget.item) ? 'Remover dos favoritos' : 'Adicionar aos favoritos'),
+          onPressed: () => widget.visibility.toggleFavoriteMedia(widget.kind, widget.item))),
+        if (snapshot.connectionState != ConnectionState.done) const LinearProgressIndicator(),
+        if (synopsis.isNotEmpty) ...[
+          const SizedBox(height: 22),
+          Text('Sinopse', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8), Text(synopsis),
+        ],
+      ]);
+    }),
+  );
+}
+
+class SeriesPage extends StatefulWidget {
+  final XtreamApi api;
+  final String seriesId, title;
+  const SeriesPage({super.key, required this.api, required this.seriesId, required this.title});
+  @override
+  State<SeriesPage> createState() => _SeriesPageState();
+}
+class _SeriesPageState extends State<SeriesPage> {
+  late Future<dynamic> future;
+  @override
+  void initState() { super.initState(); future = widget.api.get('get_series_info', {'series_id': widget.seriesId}); }
+  @override
+  Widget build(BuildContext context) => Scaffold(appBar: AppBar(title: Text(widget.title)),
+    body: FutureBuilder<dynamic>(future: future, builder: (context, snapshot) {
+      if (snapshot.connectionState != ConnectionState.done) return const Center(child: CircularProgressIndicator());
+      if (snapshot.hasError || snapshot.data is! Map) return const Center(child: Text('Não foi possível carregar os episódios.'));
+      final episodes = snapshot.data['episodes'];
+      if (episodes is! Map) return const Center(child: Text('Nenhum episódio disponível.'));
+      final seasons = episodes.keys.toList()..sort((a, b) => (int.tryParse(a.toString()) ?? 0).compareTo(int.tryParse(b.toString()) ?? 0));
+      return ListView(children: [for (final season in seasons) ...[
+        Padding(padding: const EdgeInsets.all(16), child: Text('Temporada $season', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold))),
+        if (episodes[season] is List) for (var index = 0; index < (episodes[season] as List).length; index++)
+          if (episodes[season][index] is Map) ListTile(
+            leading: const Icon(Icons.play_circle_outline),
+            title: Text(episodes[season][index]['title']?.toString() ?? 'Episódio ${episodes[season][index]['episode_num'] ?? ''}'),
+            onTap: () {
+              final raw = episodes[season][index] as Map;
+              final id = raw['id']?.toString();
+              if (id == null) return;
+              final ext = raw['container_extension']?.toString() ?? 'mp4';
+              Navigator.push(context, MaterialPageRoute(builder: (_) => PlayerPage(
+                title: raw['title']?.toString() ?? 'Episódio', url: widget.api.stream('series', id, ext), progressScope: WatchProgress.scope(widget.api), mediaType: 'series', mediaId: id, extension: ext,
+                nextEpisode: index + 1 < (episodes[season] as List).length && episodes[season][index + 1] is Map
+                  ? Map<String, dynamic>.from(episodes[season][index + 1] as Map) : null,
+                api: widget.api,
+                remainingEpisodes: (episodes[season] as List).skip(index + 1)
+                    .whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList())));
+            }),
+      ]]);
+    }),
+  );
+}
+
+class PlayerPage extends StatefulWidget {
+  final String title;
+  final Uri url;
+  final String progressScope, mediaType, mediaId, cover, extension;
+  final Map<String, dynamic>? nextEpisode;
+  final List<Map<String, dynamic>> remainingEpisodes;
+  final XtreamApi? api;
+  const PlayerPage({super.key, required this.title, required this.url,
+    this.progressScope = '', this.mediaType = 'live', this.mediaId = '', this.cover = '', this.extension = 'mp4',
+    this.nextEpisode, this.api, this.remainingEpisodes = const []});
+  @override
+  State<PlayerPage> createState() => _PlayerPageState();
+}
+
+class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
+  // Rauny IPTV Player v1.4.4: recuperação exclusiva da TV ao vivo.
+  static const liveStallLimit = Duration(seconds: 20);
+  static const maxLiveRetries = 3;
+  final Stopwatch liveClock = Stopwatch();
+  Timer? liveWatchdog, liveRetryTimer;
+  int liveRetries = 0, liveGeneration = 0;
+  bool liveConnecting = false, livePaused = false, liveBackground = false;
+  Duration liveLastMovement = Duration.zero;
+  Duration? liveBufferingSince;
+  Duration liveLastPosition = Duration.zero;
+  String liveStatus = 'Conectando à TV ao vivo...';
+  String liveFailureReason = '';
+
+  String liveErrorReason(Object? failure) {
+    // Mensagem produzida pelo adaptador local, sem os dados brutos do servidor.
+    if (failure is String && failure.startsWith('Diagnóstico HLS: ') &&
+        failure.length < 400 && !failure.contains('://')) return failure;
+    if (failure is PlatformException && const {
+      'HLS_NETWORK', 'HLS_MEDIA', 'HLS_SETUP', 'HLS_UNSUPPORTED',
+      'MEDIA_1', 'MEDIA_2', 'MEDIA_3', 'MEDIA_4', 'AUTOPLAY',
+    }.contains(failure.code)) {
+      return failure.message ?? 'Falha no motor HLS.';
+    }
+    final text = failure.toString().toLowerCase();
+    // Nunca mostrar o erro bruto: pode conter a URL com credenciais.
+    if (failure is TimeoutException) return 'Tempo de abertura do canal esgotado.';
+    if (text.contains('autoplay') || text.contains('notallowed')) {
+      return 'O navegador bloqueou o início da reprodução.';
+    }
+    if (text.contains('network') || text.contains('networkerror')) {
+      return 'O navegador informou falha de rede ao ler o vídeo.';
+    }
+    if (text.contains('decode')) return 'O navegador não conseguiu decodificar o vídeo.';
+    if (text.contains('not_supported') || text.contains('notsupported') ||
+        text.contains('src_not_supported')) {
+      return 'O navegador informou fonte ou formato de vídeo não suportado.';
+    }
+    return 'O player informou uma falha de reprodução.';
+  }
+  bool get isLive => kIsWeb && widget.mediaType == 'live';
+  VideoPlayerController? controller;
+  final FocusNode keyboardFocus = FocusNode();
+  double volume = 1.0;
+  double audibleVolume = 1.0;
+  Orientation? playerOrientation;
+  String? error;
+  bool expanded = false;
+  bool controlsVisible = true;
+  Timer? hideTimer;
+  Timer? progressTimer;
+
+  // Monitor exclusivo de filmes e series.
+  static const nativeStallLimit = Duration(seconds: 25);
+  static const maxNativeRecoveries = 2;
+  Timer? nativeWatchdog;
+  int nativeRecoveries = 0;
+  bool nativeRecovering = false;
+  Duration nativeLastPosition = Duration.zero;
+  DateTime? nativeLastMovement;
+  bool? lastPlaying;
+  bool? lastBuffering;
+  bool? lastInitialized;
+  static const autoNextKey = 'rauny_auto_next_episode_v13';
+  bool autoNextEnabled = true;
+  bool autoNextCancelled = false;
+  bool completionHandled = false;
+  int? autoNextSeconds;
+  Timer? autoNextTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    loadAutoNextPreference();
+    if (isLive) {
+      WidgetsBinding.instance.addObserver(this);
+      liveClock.start();
+      liveWatchdog = Timer.periodic(const Duration(seconds: 1), (_) => checkLive());
+      connectLive();
+    } else {
+      nativeWatchdog = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => checkNativePlayback(),
+      );
+      initialize();
+    }
+  }
+
+  void checkNativePlayback() {
+    if (!mounted || isLive || nativeRecovering || nativeConnecting) return;
+
+    final c = controller;
+    if (c == null || !c.value.isInitialized || c.value.hasError) return;
+
+    final value = c.value;
+
+    // Nao monitorar videos pausados ou concluidos.
+    if (!value.isPlaying || value.isCompleted) {
+      nativeLastPosition = value.position;
+      nativeLastMovement = null;
+      return;
+    }
+
+    final now = DateTime.now();
+
+    if (nativeLastMovement == null ||
+        value.position != nativeLastPosition) {
+      nativeLastPosition = value.position;
+      nativeLastMovement = now;
+      return;
+    }
+
+    if (now.difference(nativeLastMovement!) >= nativeStallLimit) {
+      // Diagnostico apenas: ainda nao reiniciar a reproducao.
+      nativeLastMovement = now;
+      debugPrint('Rauny IPTV: possivel travamento prolongado em filme ou serie.');
+    }
+  }
+  Future<void> loadAutoNextPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) setState(() =>
+        autoNextEnabled = prefs.getBool(autoNextKey) ?? true);
+  }
+
+  Future<void> setAutoNextPreference(bool enabled) async {
+    cancelAutoNext();
+    if (mounted) setState(() => autoNextEnabled = enabled);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(autoNextKey, enabled);
+  }
+
+  bool get hasNextEpisode =>
+      widget.api != null &&
+      (widget.remainingEpisodes.isNotEmpty || widget.nextEpisode != null);
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (kIsWeb || (defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS)) return;
+    final orientation = MediaQuery.orientationOf(context);
+    if (playerOrientation == orientation) return;
+    playerOrientation = orientation;
+    setExpanded(orientation == Orientation.landscape);
+  }
+
+  void cancelAutoNext() {
+    autoNextTimer?.cancel();
+    autoNextTimer = null;
+    if (mounted) setState(() {
+      autoNextSeconds = null;
+      autoNextCancelled = true;
+    });
+  }
+
+  void startAutoNext() {
+    if (!mounted || !hasNextEpisode || !autoNextEnabled ||
+        autoNextCancelled || autoNextSeconds != null) return;
+    setState(() => autoNextSeconds = 10);
+    autoNextTimer?.cancel();
+    autoNextTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) { timer.cancel(); return; }
+      final remaining = (autoNextSeconds ?? 0) - 1;
+      if (remaining <= 0) {
+        timer.cancel();
+        autoNextTimer = null;
+        openNextEpisode();
+      } else {
+        setState(() => autoNextSeconds = remaining);
+      }
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!isLive) return;
+    liveBackground = state != AppLifecycleState.resumed;
+    // Não contar o tempo em segundo plano como travamento de rede.
+    liveLastMovement = liveClock.elapsed;
+    liveBufferingSince = null;
+    liveLastPosition = controller?.value.position ?? Duration.zero;
+  }
+
+  Future<void> connectLive() async {
+    if (!mounted || liveConnecting) return;
+    final generation = ++liveGeneration;
+    liveRetryTimer?.cancel();
+    liveRetryTimer = null;
+    setState(() {
+      liveConnecting = true;
+      error = null;
+      liveStatus = liveRetries == 0 ? 'Conectando à TV ao vivo...'
+          : 'Reconectando à TV ao vivo ($liveRetries/$maxLiveRetries)...';
+    });
+    final old = controller;
+    controller = null;
+    old?.removeListener(refresh);
+    try {
+      if (old != null) await old.dispose().timeout(const Duration(seconds: 5));
+    } catch (_) { /* A falha ao liberar o anterior não impede a nova conexão. */ }
+    if (!mounted || generation != liveGeneration) return;
+    final c = VideoPlayerController.networkUrl(widget.url, formatHint: VideoFormat.hls);
+    controller = c;
+    lastPlaying = lastBuffering = lastInitialized = null;
+    c.addListener(refresh);
+    try {
+      await c.initialize().timeout(const Duration(seconds: 25));
+      if (!mounted || generation != liveGeneration) return;
+      await c.setVolume(volume).timeout(const Duration(seconds: 5));
+      await c.play().timeout(const Duration(seconds: 10));
+      if (!mounted || generation != liveGeneration) return;
+      liveBufferingSince = null;
+      liveLastPosition = c.value.position;
+      liveLastMovement = liveClock.elapsed;
+      setState(() {
+        liveConnecting = false;
+        livePaused = false;
+        liveStatus = 'HLS.js • aguardando imagem da TV ao vivo...';
+      });
+    } catch (failure) {
+      if (!mounted || generation != liveGeneration) return;
+      liveConnecting = false;
+      queueLiveRetry(liveErrorReason(failure));
+    }
+  }
+
+  void checkLive() {
+    if (!mounted || liveConnecting || liveRetryTimer != null || error != null ||
+        livePaused || liveBackground) return;
+    final c = controller;
+    if (c == null) return;
+    final value = c.value;
+    final moved = value.position != liveLastPosition;
+    liveLastPosition = value.position;
+    if (value.isBuffering) {
+      liveBufferingSince ??= liveClock.elapsed;
+    } else {
+      liveBufferingSince = null;
+    }
+    final prolongedBuffering = liveBufferingSince != null &&
+        liveClock.elapsed - liveBufferingSince! >= liveStallLimit;
+    if (moved && !value.hasError) liveLastMovement = liveClock.elapsed;
+    // Em live, um evento de conclusão isolado não comprova interrupção.
+    // Só recriar por erro explícito, buffering prolongado ou falta de avanço.
+    final stalled = liveClock.elapsed - liveLastMovement >= liveStallLimit;
+    if (value.hasError || prolongedBuffering || stalled) {
+      queueLiveRetry(value.hasError ? liveErrorReason(value.errorDescription)
+          : prolongedBuffering ? 'Buffering contínuo por 20 segundos.'
+          : value.isCompleted ? 'O sinal terminou e ficou 20 segundos sem avançar.'
+          : 'A reprodução ficou 20 segundos sem avançar.');
+      return;
+    }
+    final status = value.isBuffering ? 'Carregando TV ao vivo...'
+        : moved ? 'TV ao vivo • HLS.js • v1.4.4'
+        : liveStatus;
+    if (status != liveStatus) setState(() => liveStatus = status);
+  }
+
+  void queueLiveRetry(String reason) {
+    if (!mounted || !isLive || liveConnecting || liveRetryTimer != null) return;
+    liveFailureReason = reason;
+    if (liveRetries >= maxLiveRetries) {
+      setState(() {
+        error = 'Não foi possível restabelecer o canal após 3 tentativas. '
+            '$liveFailureReason';
+        liveStatus = 'TV ao vivo • conexão interrompida';
+        controlsVisible = true;
+      });
+      return;
+    }
+    liveRetries++;
+    setState(() => liveStatus =
+        '$liveFailureReason Reconexão $liveRetries/$maxLiveRetries em 2 segundos...');
+    liveRetryTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      if (liveBackground) return;
+      timer.cancel();
+      liveRetryTimer = null;
+      if (mounted) connectLive();
+    });
+  }
+
+  void retryLiveManually() {
+    if (liveConnecting || !mounted) return;
+    liveRetries = 0;
+    livePaused = false;
+    connectLive();
+  }
+
+  Widget liveStatusView({bool loading = false}) => Padding(
+    padding: const EdgeInsets.all(16),
+    child: Column(mainAxisSize: MainAxisSize.min, children: [
+      if (loading) ...[
+        const CircularProgressIndicator(), const SizedBox(height: 16),
+      ],
+      SelectableText(error ?? liveStatus, textAlign: TextAlign.center),
+      if (error != null)
+        FilledButton.icon(onPressed: retryLiveManually,
+          icon: const Icon(Icons.refresh), label: const Text('Tentar novamente')),
+      if (error != null)
+        TextButton.icon(onPressed: () async {
+          await Clipboard.setData(ClipboardData(text:
+            'Rauny IPTV Player v1.4.4\nTV ao vivo no navegador\n$error\nTentativas: $liveRetries/$maxLiveRetries'));
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Diagnóstico copiado.')));
+        }, icon: const Icon(Icons.copy), label: const Text('Copiar diagnóstico')),
+    ]),
+  );
+
+  bool nativeConnecting = false;
+  String nativeDiagnostic = '';
+
+  Widget nativeErrorView() => SingleChildScrollView(padding: const EdgeInsets.all(24), child: Column(
+    mainAxisSize: MainAxisSize.min, children: [
+      Text(error!, textAlign: TextAlign.center),
+      const SizedBox(height: 12),
+      Text(nativeDiagnostic, textAlign: TextAlign.center),
+      const SizedBox(height: 12),
+      FilledButton.icon(onPressed: nativeConnecting ? null : initialize,
+        icon: const Icon(Icons.refresh), label: const Text('Tentar novamente')),
+      TextButton.icon(onPressed: () async {
+        await Clipboard.setData(ClipboardData(text:
+          'Rauny IPTV Player v1.4.7\nTipo: ${widget.mediaType}\n$nativeDiagnostic'));
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Diagnóstico copiado.')));
+      }, icon: const Icon(Icons.copy), label: const Text('Copiar diagnóstico')),
+    ]));
+
+  Future<void> initialize() async {
+    if (nativeConnecting) return;
+    nativeConnecting = true;
+    progressTimer?.cancel();
+    final previous = controller;
+    controller = null;
+    previous?.removeListener(refresh);
+    if (mounted) setState(() { error = null; nativeDiagnostic = ''; });
+    if (previous != null) await previous.dispose();
+    if (!mounted) { nativeConnecting = false; return; }
+    completionHandled = false;
+    lastPlaying = null;
+    lastBuffering = null;
+    lastInitialized = null;
+    final c = VideoPlayerController.networkUrl(widget.url);
+    controller = c;
+    c.addListener(refresh);
+    try {
+      await c.initialize().timeout(const Duration(seconds: 25));
+      if (!mounted || controller != c) return;
+      final saved = await WatchProgress.get(widget.progressScope, widget.mediaType, widget.mediaId);
+      if (!mounted) return;
+      final seconds = (saved?['position'] as num?)?.toInt() ?? 0;
+      if (widget.mediaType != 'live' && seconds > 5 && c.value.duration.inSeconds > seconds + 30) {
+        final resume = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+          title: const Text('Continuar assistindo?'),
+          content: Text('Você parou em ${clock(Duration(seconds: seconds))}.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Desde o início')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Continuar')),
+          ],
+        ));
+        if (!mounted) return;
+        if (resume == true) await c.seekTo(Duration(seconds: seconds));
+      }
+      await c.setVolume(volume);
+      await c.play();
+      progressTimer = Timer.periodic(const Duration(seconds: 15), (_) => saveProgress());
+      if (mounted) setState(() {});
+    } catch (failure) {
+      if (mounted && controller == c) {
+        setState(() {
+          nativeDiagnostic = nativeVideoDiagnostic(failure);
+          error = 'Não foi possível reproduzir este vídeo.';
+        });
+      }
+    } finally {
+      nativeConnecting = false;
+    }
+  }
+
+  Future<void> saveProgress() async {
+    final c = controller;
+    if (c == null || !c.value.isInitialized) return;
+    await WatchProgress.save(widget.progressScope, widget.mediaType, widget.mediaId,
+      widget.title, widget.cover, c.value.position, c.value.duration,);
+    // Preserva a extensão real para retomar episódios/filmes não-MP4.
+    if (widget.progressScope.isNotEmpty && widget.mediaId.isNotEmpty && widget.mediaType != 'live') {
+      final prefs = await SharedPreferences.getInstance();
+      final k = WatchProgress.key(widget.progressScope, widget.mediaType, widget.mediaId);
+      final raw = prefs.getString(k);
+      if (raw != null) {
+        try {
+          final data = Map<String,dynamic>.from(jsonDecode(raw) as Map);
+          data['extension'] = widget.extension;
+          await prefs.setString(k, jsonEncode(data));
+        } catch (_) {}
+      }
+    }
+  }
+
+  void refresh() {
+    if (!mounted) return;
+    final c = controller;
+    if (c == null) return;
+    final value = c.value;
+    if (!isLive && value.hasError) {
+      if (error == null) setState(() {
+        error = 'A reprodução foi interrompida.';
+        nativeDiagnostic = nativeVideoDiagnostic(PlatformException(
+          code: 'VideoError', message: value.errorDescription));
+      });
+      return;
+    }
+    // video_player notifica também a passagem do tempo do vídeo.
+    // Não reconstruímos a árvore/elemento HTML de vídeo a cada posição.
+    final playingChanged = lastPlaying != value.isPlaying;
+    final bufferingChanged = lastBuffering != value.isBuffering;
+    final initializedChanged = lastInitialized != value.isInitialized;
+    // Detecta conclusão sem reconstruir o player a cada atualização de posição.
+    // isCompleted evita disparos quando o usuário apenas busca perto do final.
+    if (value.isCompleted && !completionHandled) {
+      completionHandled = true;
+      if (autoNextEnabled && hasNextEpisode && !autoNextCancelled) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) startAutoNext();
+        });
+      }
+    }
+    if (!playingChanged && !bufferingChanged && !initializedChanged) return;
+    lastPlaying = value.isPlaying;
+    lastBuffering = value.isBuffering;
+    lastInitialized = value.isInitialized;
+    if (expanded && !value.isPlaying && !controlsVisible) {
+      hideTimer?.cancel();
+      setState(() => controlsVisible = true);
+    } else {
+      setState(() {});
+    }
+    if (expanded && value.isPlaying && playingChanged) scheduleHide();
+  }
+
+  void scheduleHide() {
+    hideTimer?.cancel();
+    if (!expanded || controller?.value.isPlaying != true) return;
+    hideTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted && expanded && controller?.value.isPlaying == true) {
+        setState(() => controlsVisible = false);
+      }
+    });
+  }
+
+  void revealControls() {
+    if (!expanded) return;
+    if (!controlsVisible) setState(() => controlsVisible = true);
+    scheduleHide();
+  }
+
+  void toggleExpanded() {
+    setExpanded(!expanded);
+  }
+
+  void setExpanded(bool value) {
+    if (expanded == value) return;
+    hideTimer?.cancel();
+    setState(() {
+      expanded = value;
+      controlsVisible = true;
+    });
+    if (expanded) scheduleHide();
+  }
+
+  Future<void> seekRelative(int seconds) async {
+    if (isLive) return;
+    final c = controller;
+    if (c == null || !c.value.isInitialized) return;
+    final current = c.value.position.inMilliseconds;
+    final duration = c.value.duration.inMilliseconds;
+    final target = (current + seconds * 1000).clamp(0, duration > 0 ? duration : current + seconds.abs() * 1000);
+    await c.seekTo(Duration(milliseconds: target));
+    revealControls();
+  }
+
+  Future<void> changeVolume(double value) async {
+    final c = controller;
+    if (c == null) return;
+    await c.setVolume(value);
+    if (mounted) setState(() {
+      volume = value;
+      if (value > 0) audibleVolume = value;
+    });
+    revealControls();
+  }
+
+  KeyEventResult handleKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.space || event.logicalKey == LogicalKeyboardKey.keyK) {
+      togglePlayback(); return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+      seekRelative(-10); return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+      seekRelative(10); return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+      changeVolume((volume + 0.1).clamp(0.0, 1.0)); return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+      changeVolume((volume - 0.1).clamp(0.0, 1.0)); return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyF) {
+      toggleExpanded(); return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.escape && expanded) {
+      toggleExpanded(); return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void openNextEpisode() {
+    autoNextTimer?.cancel();
+    autoNextTimer = null;
+    final next = widget.remainingEpisodes.isNotEmpty
+        ? widget.remainingEpisodes.first : widget.nextEpisode;
+    final api = widget.api;
+    if (next == null || api == null) return;
+    final id = next['id']?.toString();
+    if (id == null || id.isEmpty) return;
+    final ext = next['container_extension']?.toString() ?? 'mp4';
+    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => PlayerPage(
+      title: next['title']?.toString() ?? 'Próximo episódio',
+      url: api.stream('series', id, ext), progressScope: widget.progressScope,
+      mediaType: 'series', mediaId: id, extension: ext, api: api,
+      remainingEpisodes: widget.remainingEpisodes.isNotEmpty
+          ? widget.remainingEpisodes.skip(1).toList() : const [])));
+  }
+
+  Widget extraControls() => Wrap(alignment: WrapAlignment.center, crossAxisAlignment: WrapCrossAlignment.center, children: [
+    if (widget.mediaType == 'movie' || widget.mediaType == 'series')
+      DownloadVideoButton(key: ValueKey(widget.url), url: widget.url, title: widget.title,
+        extension: widget.extension, mediaType: widget.mediaType),
+    IconButton(tooltip: 'Voltar 10 segundos', icon: const Icon(Icons.replay_10), onPressed: () => seekRelative(-10)),
+    IconButton(tooltip: 'Avançar 10 segundos', icon: const Icon(Icons.forward_10), onPressed: () => seekRelative(10)),
+    IconButton(tooltip: volume == 0 ? 'Ativar áudio' : 'Silenciar áudio',
+      onPressed: () => changeVolume(volume == 0 ? audibleVolume : 0),
+      icon: Icon(volume == 0 ? Icons.volume_off : Icons.volume_up, size: 20)),
+    SizedBox(width: 120, child: Slider(value: volume, min: 0, max: 1, onChanged: changeVolume)),
+    if (hasNextEpisode) IconButton(
+      tooltip: 'Próximo episódio', icon: const Icon(Icons.skip_next),
+      onPressed: openNextEpisode),
+    if (widget.mediaType == 'series') PopupMenuButton<bool>(
+      tooltip: 'Reprodução automática',
+      icon: Icon(autoNextEnabled ? Icons.playlist_play : Icons.play_disabled),
+      onSelected: setAutoNextPreference,
+      itemBuilder: (_) => [
+        CheckedPopupMenuItem<bool>(
+          value: true, checked: autoNextEnabled,
+          child: const Text('Próximo episódio automático: ligado')),
+        CheckedPopupMenuItem<bool>(
+          value: false, checked: !autoNextEnabled,
+          child: const Text('Próximo episódio automático: desligado')),
+      ],
+    ),
+  ]);
+
+  Future<void> togglePlayback() async {
+    final c = controller;
+    if (c == null || !c.value.isInitialized) return;
+    if (isLive && (liveConnecting || liveRetryTimer != null || error != null)) return;
+    if (c.value.isPlaying) {
+      if (isLive) livePaused = true;
+      hideTimer?.cancel();
+      await c.pause();
+      if (mounted) setState(() => controlsVisible = true);
+    } else {
+      if (isLive) {
+        livePaused = false;
+        liveBufferingSince = null;
+        liveLastMovement = liveClock.elapsed;
+        liveLastPosition = c.value.position;
+      }
+      await c.play();
+      if (mounted) {
+        setState(() => controlsVisible = true);
+        scheduleHide();
+      }
+    }
+  }
+
+
+  Widget playbackTimes(VideoPlayerController c) => widget.mediaType == 'live'
+    ? const Padding(padding: EdgeInsets.all(8), child: Text('Transmissão ao vivo'))
+    : ValueListenableBuilder<VideoPlayerValue>(
+    valueListenable: c,
+    builder: (context, value, _) {
+      final total = value.duration;
+      final position = value.position > total && total > Duration.zero ? total : value.position;
+      final remaining = total > position ? total - position : Duration.zero;
+      return Padding(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+        child: Wrap(alignment: WrapAlignment.spaceBetween, spacing: 12, runSpacing: 4, children: [
+          Text('Assistido ${clock(position)}', style: const TextStyle(fontSize: 12)),
+          Text(total > Duration.zero ? 'Total ${clock(total)}' : 'Duração indisponível', style: const TextStyle(fontSize: 12)),
+          Text(total > Duration.zero ? 'Faltam ${clock(remaining)}' : '', style: const TextStyle(fontSize: 12)),
+        ]));
+    });
+  @override
+  void dispose() {
+    liveGeneration++;
+    WidgetsBinding.instance.removeObserver(this);
+    liveWatchdog?.cancel();
+    liveRetryTimer?.cancel();
+    liveClock.stop();
+    hideTimer?.cancel();
+    progressTimer?.cancel();
+    autoNextTimer?.cancel();
+    keyboardFocus.dispose();
+    saveProgress();
+    controller?.removeListener(refresh);
+    controller?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final ready = c != null && c.value.isInitialized;
+    return Scaffold(
+      backgroundColor: expanded ? Colors.black : null,
+      appBar: expanded ? null : AppBar(title: Text(widget.title)),
+      body: Focus(autofocus: true, focusNode: keyboardFocus, onKeyEvent: handleKey, child: error != null
+          ? Center(child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: isLive ? liveStatusView() : nativeErrorView(),
+            ))
+          : !ready
+              ? Center(child: isLive ? liveStatusView(loading: true) : const CircularProgressIndicator())
+              : LayoutBuilder(builder: (context, constraints) {
+                  final ratio = c.value.aspectRatio > 0
+                      ? c.value.aspectRatio : 16 / 9;
+                  // A mesma instância de VideoPlayer permanece montada no
+                  // mesmo ponto da árvore ao alternar o modo ampliado.
+                  // Isso evita desmontar o elemento de vídeo do navegador.
+                  return Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Center(
+                        child: AspectRatio(
+                          aspectRatio: ratio,
+                          child: VideoPlayer(c),
+                        ),
+                      ),
+                      if (c.value.isBuffering)
+                        const Positioned(
+                          top: 14,
+                          right: 14,
+                          child: SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        ),
+                      if (expanded)
+                        Positioned.fill(
+                          child: MouseRegion(
+                            onHover: (_) => revealControls(),
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.translucent,
+                              onTap: revealControls,
+                              child: const SizedBox.expand(),
+                            ),
+                          ),
+                        ),
+                      if (isLive)
+                        Positioned(left: 12, right: 12, top: 12,
+                          child: IgnorePointer(child: Card(
+                            color: const Color(0xDD18243A),
+                            child: Padding(padding: const EdgeInsets.all(10),
+                              child: Text(liveStatus, textAlign: TextAlign.center)),
+                          ))),
+                      if (autoNextSeconds != null && hasNextEpisode)
+                        Positioned(
+                          left: 16, right: 16, top: 42,
+                          child: Card(
+                            color: const Color(0xEE18243A),
+                            child: Padding(
+                              padding: const EdgeInsets.all(14),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text('Próximo episódio em $autoNextSeconds segundos',
+                                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                                  const SizedBox(height: 8),
+                                  LinearProgressIndicator(
+                                    value: (10 - autoNextSeconds!) / 10,
+                                    minHeight: 5,
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      TextButton(
+                                        onPressed: cancelAutoNext,
+                                        child: const Text('Cancelar'),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      FilledButton(
+                                        onPressed: openNextEpisode,
+                                        child: const Text('Assistir agora'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (expanded && controlsVisible)
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: Container(
+                            padding: const EdgeInsets.fromLTRB(12, 20, 12, 12),
+                            decoration: const BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [Colors.transparent, Color(0xDD000000)],
+                              ),
+                            ),
+                            child: SafeArea(
+                              top: false,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (!isLive) VideoProgressIndicator(
+                                    c,
+                                    allowScrubbing: true,
+                                    padding: const EdgeInsets.symmetric(vertical: 10),
+                                  ),
+                                  playbackTimes(c),
+                                  extraControls(),
+                                  Row(
+                                    children: [
+                                      IconButton(
+                                        tooltip: c.value.isPlaying ? 'Pausar' : 'Reproduzir',
+                                        iconSize: 36,
+                                        icon: Icon(c.value.isPlaying
+                                            ? Icons.pause_circle : Icons.play_circle),
+                                        onPressed: togglePlayback,
+                                      ),
+                                      Expanded(
+                                        child: Text(widget.title,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis),
+                                      ),
+                                      IconButton(
+                                        tooltip: 'Sair da tela ampliada',
+                                        iconSize: 32,
+                                        icon: const Icon(Icons.fullscreen_exit),
+                                        onPressed: toggleExpanded,
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (!expanded)
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: Container(
+                            color: Theme.of(context).scaffoldBackgroundColor,
+                            child: SafeArea(
+                              top: false,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (!isLive) Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                                    child: VideoProgressIndicator(
+                                      c,
+                                      allowScrubbing: true,
+                                      padding: const EdgeInsets.symmetric(vertical: 12),
+                                    ),
+                                  ),
+                                  playbackTimes(c),
+                                  extraControls(),
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      IconButton(
+                                        tooltip: c.value.isPlaying ? 'Pausar' : 'Reproduzir',
+                                        iconSize: 40,
+                                        icon: Icon(c.value.isPlaying
+                                            ? Icons.pause_circle : Icons.play_circle),
+                                        onPressed: togglePlayback,
+                                      ),
+                                      IconButton(
+                                        tooltip: 'Ampliar vídeo',
+                                        iconSize: 34,
+                                        icon: const Icon(Icons.fullscreen),
+                                        onPressed: toggleExpanded,
+                                      ),
+                                    ],
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.all(12),
+                                    child: Text(
+                                      kIsWeb ? 'Áudio e legendas: seleção de faixas indisponível neste player do Chrome. Atalhos: Espaço/K, ←/→, ↑/↓ e F.' : 'Áudio e legendas: seleção de faixas indisponível nesta versão.',
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                })),
+    );
+  }
+}
