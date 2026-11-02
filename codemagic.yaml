@@ -14,12 +14,7 @@ workflows:
         script: |
           flutter pub get
 
-      - name: Preparar iOS
-        script: |
-          cd ios
-          pod install
-
-      - name: Compilar iOS Release
+          - name: Compilar iOS Release
         script: |
           flutter build ios --release --no-codesign
 
